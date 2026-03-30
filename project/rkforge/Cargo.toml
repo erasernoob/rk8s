@@ -54,6 +54,7 @@ tempfile = { workspace = true }
 uzers = { workspace = true }
 rayon = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
+libloading = { workspace = true }
 serial_test = { workspace = true }
 tabwriter = { workspace = true }
 bincode = { workspace = true }
