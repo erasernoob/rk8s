@@ -36,6 +36,11 @@ fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer().with_thread_ids(true))
         .with(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+
+    if sandbox::guest::should_run_as_init() {
+        return sandbox::guest::run_as_init();
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -95,6 +100,8 @@ fn main() -> Result<()> {
         Commands::Save(args) => images::save_image(args),
         Commands::Sandbox(cmd) => sandbox::cli::execute(cmd),
         Commands::SandboxShim(args) => sandbox::vm::run_shim_command(args),
+        Commands::SandboxAgent(args) => sandbox::agent::run_command(args),
+        Commands::SandboxGuestInit(args) => sandbox::guest::run_command(args),
         Commands::Start(args) => container::start_container(&args.container_name),
         Commands::State(args) => container::state_container(&args.container_name),
         Commands::Tag(args) => images::tag_image(args),

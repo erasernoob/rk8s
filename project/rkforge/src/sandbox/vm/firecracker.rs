@@ -1,4 +1,4 @@
-use crate::sandbox::protocol::GuestReadyEvent;
+use crate::sandbox::protocol::{GuestReadyEvent, ReadyStage};
 use crate::sandbox::vm::{VmBackend, VmInstanceHandle, VmInstanceSpec, VmmKind};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -229,12 +229,13 @@ pub fn run_firecracker_shim(spec: VmInstanceSpec) -> Result<()> {
         serde_json::to_vec_pretty(&runtime_state)?,
     )?;
 
-    let ready = GuestReadyEvent {
-        sandbox_id: spec.sandbox_id.clone(),
-        agent_version: "rkforge-firecracker-shim".to_string(),
-        transport: "firecracker-api".to_string(),
-        timestamp: Utc::now(),
-    };
+        let ready = GuestReadyEvent {
+            sandbox_id: spec.sandbox_id.clone(),
+            stage: ReadyStage::VmmReady,
+            agent_version: "rkforge-firecracker-vmm".to_string(),
+            transport: "firecracker-api".to_string(),
+            timestamp: Utc::now(),
+        };
     fs::write(&spec.ready_file, serde_json::to_vec_pretty(&ready)?).with_context(|| {
         format!(
             "failed to write ready signal for sandbox {}",

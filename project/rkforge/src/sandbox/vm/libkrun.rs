@@ -1,8 +1,8 @@
 use crate::sandbox::protocol::GuestReadyEvent;
+use crate::sandbox::read_message;
 use crate::sandbox::vm::{VmBackend, VmInstanceHandle, VmInstanceSpec, VmmKind};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use chrono::Utc;
 use libloading::Library;
 use nix::sys::signal;
 use nix::unistd::Pid;
@@ -11,8 +11,10 @@ use std::ffi::{CString, OsString};
 use std::fs;
 use std::os::raw::{c_char, c_int};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -119,6 +121,7 @@ impl VmBackend for LibkrunVmBackend {
         fs::create_dir_all(&spec.work_dir)
             .with_context(|| format!("failed to create {}", spec.work_dir.display()))?;
         cleanup_runtime_paths(spec)?;
+        spawn_ready_listener(spec)?;
         self.save_spec(spec)?;
 
         let shim_pid = self.spawn_shim(&self.spec_path(&spec.sandbox_id))?;
@@ -218,19 +221,6 @@ pub fn run_libkrun_shim(spec: VmInstanceSpec) -> Result<()> {
         serde_json::to_vec_pretty(&shim_state)?,
     )?;
 
-    let ready = GuestReadyEvent {
-        sandbox_id: spec.sandbox_id.clone(),
-        agent_version: "rkforge-libkrun-shim".to_string(),
-        transport: format!("vsock://{}", spec.agent_vsock_port),
-        timestamp: Utc::now(),
-    };
-    fs::write(&spec.ready_file, serde_json::to_vec_pretty(&ready)?).with_context(|| {
-        format!(
-            "failed to write ready signal for sandbox {}",
-            spec.sandbox_id
-        )
-    })?;
-
     let runtime_state = RuntimeState {
         vmm_pid: std::process::id(),
         libkrun_library: libkrun_library.clone(),
@@ -264,7 +254,7 @@ unsafe fn configure_ctx(symbols: &LibkrunSymbols, spec: &VmInstanceSpec) -> Resu
         let initrd_path = spec
             .initrd_path
             .as_ref()
-            .map(path_cstring)
+            .map(|path| path_cstring(path.as_path()))
             .transpose()?;
         let boot_args = CString::new(default_boot_args(spec))
             .context("failed to encode libkrun boot arguments")?;
@@ -405,7 +395,31 @@ fn wait_for_runtime_state(path: &Path, timeout: Duration) -> Result<RuntimeState
 fn default_boot_args(spec: &VmInstanceSpec) -> String {
     spec.boot_args
         .clone()
-        .unwrap_or_else(|| "console=ttyS0 reboot=k panic=1".to_string())
+        .unwrap_or_else(|| {
+            format!(
+                "console=ttyS0 reboot=k panic=1 rkforge.sandbox_id={}",
+                spec.sandbox_id
+            )
+        })
+}
+
+fn spawn_ready_listener(spec: &VmInstanceSpec) -> Result<()> {
+    let listener = UnixListener::bind(&spec.ready_socket_path).with_context(|| {
+        format!(
+            "failed to bind ready socket {}",
+            spec.ready_socket_path.display()
+        )
+    })?;
+    let ready_file = spec.ready_file.clone();
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept()
+            && let Ok(event) = read_message::<GuestReadyEvent>(&mut stream)
+            && let Ok(bytes) = serde_json::to_vec_pretty(&event)
+        {
+            let _ = fs::write(&ready_file, bytes);
+        }
+    });
+    Ok(())
 }
 
 fn path_cstring(path: &Path) -> Result<CString> {

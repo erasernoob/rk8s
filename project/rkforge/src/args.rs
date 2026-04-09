@@ -1,4 +1,6 @@
 use crate::commands::{ComposeCommand, PodCommand, VolumeCommand, config_cli::ConfigArgs};
+use crate::sandbox::agent::SandboxAgentArgs;
+use crate::sandbox::guest::SandboxGuestInitArgs;
 use crate::sandbox::cli::SandboxCommand;
 use crate::sandbox::vm::SandboxShimArgs;
 use crate::{copy, image, images, login, logout, overlayfs, pull, push, repo, run};
@@ -71,6 +73,10 @@ pub enum Commands {
     Sandbox(SandboxCommand),
     #[command(hide = true, name = "sandbox-shim")]
     SandboxShim(SandboxShimArgs),
+    #[command(hide = true, name = "sandbox-agent")]
+    SandboxAgent(SandboxAgentArgs),
+    #[command(hide = true, name = "sandbox-guest-init")]
+    SandboxGuestInit(SandboxGuestInitArgs),
     /// Start one or more containers
     Start(StartArgs),
     /// Display the status of a container

@@ -1,18 +1,21 @@
+pub mod agent;
 pub mod cli;
+pub mod guest;
 pub mod protocol;
 pub mod vm;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use protocol::{GuestExecRequest, GuestExecResponse};
+use protocol::{GuestExecRequest, GuestExecResponse, ReadyStage};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
-use vm::{FirecrackerVmBackend, VmBackend, VmInstanceHandle, build_vm_spec};
+use vm::{FirecrackerVmBackend, LibkrunVmBackend, VmBackend, VmInstanceHandle, VmmKind, build_vm_spec};
 
 /// Current Single Sandbox State
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -106,14 +109,24 @@ pub trait SandboxBackend: Send + Sync {
 pub struct MicroVmSandboxBackend {
     vm_backend: Arc<dyn VmBackend>,
     root: PathBuf,
+    vmm_kind: VmmKind,
 }
 
 impl MicroVmSandboxBackend {
     pub fn new(root: PathBuf) -> Result<Self> {
+        let vmm_kind = VmmKind::from_env()?;
+        Self::new_with_vmm(root, vmm_kind)
+    }
+
+    pub fn new_with_vmm(root: PathBuf, vmm_kind: VmmKind) -> Result<Self> {
+        let vm_backend: Arc<dyn VmBackend> = match vmm_kind {
+            VmmKind::Firecracker => Arc::new(FirecrackerVmBackend::new(root.clone())?),
+            VmmKind::Libkrun => Arc::new(LibkrunVmBackend::new(root.clone())?),
+        };
         Ok(Self {
-            // TODO: Support other VmBackend in the future
-            vm_backend: Arc::new(FirecrackerVmBackend::new(root.clone())?),
+            vm_backend,
             root,
+            vmm_kind,
         })
     }
 
@@ -161,6 +174,7 @@ impl SandboxBackend for MicroVmSandboxBackend {
             info.spec.cpus,
             info.spec.memory_mib,
             info.spec.persistent,
+            self.vmm_kind,
         );
         let handle = self.vm_backend.boot(&spec).await?;
         self.save_handle(&handle)?;
@@ -176,17 +190,43 @@ impl SandboxBackend for MicroVmSandboxBackend {
     }
 
     async fn exec(&self, info: &SandboxInfo, request: &ExecRequest) -> Result<ExecResult> {
-        let mut stderr = String::new();
-        stderr.push_str("microvm is booted, but guest-agent exec is not wired yet\n");
-        if request.inline_code.is_some() {
-            stderr.push_str("python code was accepted by the host runtime stub\n");
+        let handle = self
+            .load_handle(&info.id)?
+            .ok_or_else(|| anyhow!("vm handle missing for sandbox {}", info.id))?;
+
+        match handle.vmm_kind {
+            VmmKind::Libkrun => {
+                let socket_path = handle.agent_socket_path.as_ref().ok_or_else(|| {
+                    anyhow!("agent socket path missing for sandbox {}", info.id)
+                })?;
+                let mut stream = connect_agent_socket(socket_path)?;
+                write_message(&mut stream, request)?;
+                stream.flush()?;
+                let response: ExecResult = read_message(&mut stream)?;
+                Ok(response)
+            }
+            VmmKind::Firecracker => {
+                let mut stderr = String::new();
+                stderr.push_str(
+                    "sandbox reached phase-1 VMM readiness, but Firecracker guest-agent exec is not wired yet\n",
+                );
+                if request.inline_code.is_some() {
+                    stderr.push_str(
+                        "python code was accepted by the host runtime stub and was not executed inside the guest\n",
+                    );
+                }
+                Ok(ExecResult {
+                    request_id: request.request_id.clone(),
+                    stdout: format!(
+                        "sandbox {} is {:?}; guest-agent integration is the next step\n",
+                        info.id,
+                        ReadyStage::VmmReady
+                    ),
+                    stderr,
+                    exit_code: 0,
+                })
+            }
         }
-        Ok(ExecResult {
-            request_id: request.request_id.clone(),
-            stdout: format!("sandbox {} is ready for guest-agent integration\n", info.id),
-            stderr,
-            exit_code: 0,
-        })
     }
 
     async fn stop(&self, info: &SandboxInfo) -> Result<()> {
@@ -210,6 +250,48 @@ impl SandboxBackend for MicroVmSandboxBackend {
         }
         Ok(())
     }
+}
+
+fn connect_agent_socket(path: &Path) -> Result<std::os::unix::net::UnixStream> {
+    const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+    let deadline = std::time::Instant::now() + CONNECT_TIMEOUT;
+    loop {
+        match std::os::unix::net::UnixStream::connect(path) {
+            Ok(stream) => return Ok(stream),
+            Err(err) if std::time::Instant::now() < deadline => {
+                let _ = err;
+                std::thread::sleep(RETRY_INTERVAL);
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to connect to guest agent socket {}; ensure the guest image starts `rkforge sandbox-agent`",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+}
+
+fn write_message<T: Serialize>(writer: &mut impl Write, value: &T) -> Result<()> {
+    let payload = serde_json::to_vec(value)?;
+    let len = u32::try_from(payload.len()).context("message too large")?;
+    writer.write_all(&len.to_be_bytes())?;
+    writer.write_all(&payload)?;
+    Ok(())
+}
+
+fn read_message<T: for<'de> Deserialize<'de>>(reader: &mut impl Read) -> Result<T> {
+    let mut len_buf = [0_u8; 4];
+    reader.read_exact(&mut len_buf)?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    let mut payload = vec![0_u8; len];
+    reader.read_exact(&mut payload)?;
+    let value = serde_json::from_slice(&payload)?;
+    Ok(value)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
