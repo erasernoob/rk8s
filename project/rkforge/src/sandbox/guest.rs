@@ -6,6 +6,7 @@ use std::ffi::CString;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use tracing::debug;
 
 const DEFAULT_AGENT_VSOCK_PORT: u32 = 26_950;
 const DEFAULT_READY_VSOCK_PORT: u32 = 26_951;
@@ -37,6 +38,7 @@ pub fn run_as_init() -> Result<()> {
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(DEFAULT_AGENT_VSOCK_PORT);
+    debug!(vsock_port = port, "running rkforge as guest init");
     run_guest_init(SandboxGuestInitArgs { vsock_port: port })
 }
 
@@ -45,11 +47,13 @@ pub fn run_command(args: SandboxGuestInitArgs) -> Result<()> {
 }
 
 fn run_guest_init(args: SandboxGuestInitArgs) -> Result<()> {
+    debug!(vsock_port = args.vsock_port, "starting guest init");
     prepare_guest_filesystem()?;
     exec_agent(args.vsock_port)
 }
 
 fn prepare_guest_filesystem() -> Result<()> {
+    debug!("preparing guest filesystem mounts");
     ensure_dir("/proc")?;
     ensure_dir("/sys")?;
     ensure_dir("/dev")?;
@@ -92,6 +96,7 @@ fn mount_fs(
     flags: MsFlags,
     data: Option<&str>,
 ) -> Result<()> {
+    debug!(source=?source, target, fstype=?fstype, data=?data, "mounting guest filesystem");
     match mount(source, target, fstype, flags, data) {
         Ok(()) => Ok(()),
         Err(nix::errno::Errno::EBUSY) => Ok(()),
@@ -109,6 +114,13 @@ fn exec_agent(vsock_port: u32) -> Result<()> {
     let current_exe =
         std::env::current_exe().context("failed to resolve current executable inside guest")?;
     let current_exe = canonical_binary_path(current_exe);
+    debug!(
+        sandbox_id=%sandbox_id,
+        vsock_port,
+        ready_vsock_port,
+        current_exe=%current_exe.display(),
+        "execing sandbox-agent from guest init"
+    );
     let current_exe = CString::new(current_exe.as_os_str().as_bytes())
         .context("guest init path contains interior NUL")?;
     let arg0 = CString::new("rkforge").unwrap();

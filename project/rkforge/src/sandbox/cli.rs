@@ -89,7 +89,7 @@ pub fn execute(cmd: SandboxCommand) -> Result<()> {
                 .ok_or_else(|| anyhow!("sandbox not found"))?;
             let result = rt::block_on(async {
                 if let Some(code) = args.code {
-                    let mut request = ExecRequest::new(sandbox.id.clone(), "python3");
+                    let mut request = ExecRequest::new(sandbox.id.clone(), "python3"); // TODO: change the default command "python3"  
                     request.inline_code = Some(code);
                     request.language = Some("python".to_string());
                     request.timeout_secs = Some(args.timeout_secs);

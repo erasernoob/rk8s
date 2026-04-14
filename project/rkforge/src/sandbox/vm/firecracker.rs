@@ -1,5 +1,8 @@
 use crate::sandbox::protocol::{GuestReadyEvent, ReadyStage};
-use crate::sandbox::vm::{VmBackend, VmInstanceHandle, VmInstanceSpec, VmmKind};
+use crate::sandbox::vm::{
+    VmBackend, VmInstanceHandle, VmInstanceSpec, VmmKind, load_shim_failure, shim_failure_path,
+    shim_log_path, spawn_shim_process,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -98,21 +101,10 @@ impl FirecrackerVmBackend {
     }
 
     fn spawn_shim(&self, spec_path: &Path) -> Result<u32> {
-        let child = Command::new(&self.shim_binary)
-            .arg("sandbox-shim")
-            .arg("--spec")
-            .arg(spec_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "failed to spawn sandbox shim via {}",
-                    self.shim_binary.display()
-                )
-            })?;
-        Ok(child.id())
+        let work_dir = spec_path
+            .parent()
+            .ok_or_else(|| anyhow!("shim spec path has no parent: {}", spec_path.display()))?;
+        spawn_shim_process(&self.shim_binary, spec_path, work_dir)
     }
 }
 
@@ -128,6 +120,7 @@ impl VmBackend for FirecrackerVmBackend {
         let shim_pid = self.spawn_shim(&self.spec_path(&spec.sandbox_id))?;
         let runtime_state = wait_for_runtime_state(
             &self.runtime_state_path(&spec.sandbox_id),
+            &spec.work_dir,
             self.boot_timeout,
         )?;
 
@@ -159,6 +152,12 @@ impl VmBackend for FirecrackerVmBackend {
                     .with_context(|| "failed to parse guest ready event")?;
                 return Ok(event);
             }
+            if let Some(failure) = load_shim_failure(&handle.work_dir)? {
+                return Err(anyhow!(
+                    "sandbox shim failed before guest ready: {}",
+                    failure.error
+                ));
+            }
             tokio::time::sleep(DEFAULT_POLL_INTERVAL).await;
         }
         Err(anyhow!(
@@ -169,7 +168,7 @@ impl VmBackend for FirecrackerVmBackend {
 
     async fn stop(&self, handle: &VmInstanceHandle) -> Result<()> {
         if let Some(pid) = handle.pid {
-        let _ = signal::kill(Pid::from_raw(pid as i32), signal::Signal::SIGTERM);
+            let _ = signal::kill(Pid::from_raw(pid as i32), signal::Signal::SIGTERM);
         }
         if let Some(shim_pid) = handle.shim_pid
             && Some(shim_pid) != handle.pid
@@ -229,13 +228,13 @@ pub fn run_firecracker_shim(spec: VmInstanceSpec) -> Result<()> {
         serde_json::to_vec_pretty(&runtime_state)?,
     )?;
 
-        let ready = GuestReadyEvent {
-            sandbox_id: spec.sandbox_id.clone(),
-            stage: ReadyStage::VmmReady,
-            agent_version: "rkforge-firecracker-vmm".to_string(),
-            transport: "firecracker-api".to_string(),
-            timestamp: Utc::now(),
-        };
+    let ready = GuestReadyEvent {
+        sandbox_id: spec.sandbox_id.clone(),
+        stage: ReadyStage::VmmReady,
+        agent_version: "rkforge-firecracker-vmm".to_string(),
+        transport: "firecracker-api".to_string(),
+        timestamp: Utc::now(),
+    };
     fs::write(&spec.ready_file, serde_json::to_vec_pretty(&ready)?).with_context(|| {
         format!(
             "failed to write ready signal for sandbox {}",
@@ -254,6 +253,8 @@ fn cleanup_runtime_paths(spec: &VmInstanceSpec) -> Result<()> {
         spec.work_dir.join("runtime-state.json"),
         spec.work_dir.join("shim.pid"),
         spec.work_dir.join("shim-state.json"),
+        shim_failure_path(&spec.work_dir),
+        shim_log_path(&spec.work_dir),
     ];
     for path in paths {
         if path.exists() {
@@ -343,7 +344,7 @@ fn wait_for_socket(socket_path: &Path, timeout: Duration) -> Result<()> {
     ))
 }
 
-fn wait_for_runtime_state(path: &Path, timeout: Duration) -> Result<RuntimeState> {
+fn wait_for_runtime_state(path: &Path, work_dir: &Path, timeout: Duration) -> Result<RuntimeState> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if path.exists() {
@@ -352,6 +353,12 @@ fn wait_for_runtime_state(path: &Path, timeout: Duration) -> Result<RuntimeState
             let state: RuntimeState =
                 serde_json::from_slice(&bytes).with_context(|| "failed to parse runtime state")?;
             return Ok(state);
+        }
+        if let Some(failure) = load_shim_failure(work_dir)? {
+            return Err(anyhow!(
+                "sandbox shim failed before runtime state was written: {}",
+                failure.error
+            ));
         }
         std::thread::sleep(DEFAULT_POLL_INTERVAL);
     }

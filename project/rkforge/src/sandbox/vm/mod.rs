@@ -4,8 +4,14 @@ use async_trait::async_trait;
 use clap::Args;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use tracing::debug;
 
 pub mod firecracker;
 pub mod libkrun;
@@ -96,6 +102,14 @@ pub struct SandboxShimArgs {
 const DEFAULT_GUEST_CID: u32 = 3;
 const DEFAULT_AGENT_VSOCK_PORT: u32 = 26_950;
 const DEFAULT_READY_VSOCK_PORT: u32 = 26_951;
+const SHIM_LOG_FILE: &str = "shim.log";
+const SHIM_FAILURE_FILE: &str = "shim-failure.json";
+const SHIM_INHERIT_STDIO_ENV: &str = "RKFORGE_SANDBOX_INHERIT_STDIO";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShimFailure {
+    pub error: String,
+}
 
 pub fn build_vm_spec(
     root: &Path,
@@ -110,6 +124,19 @@ pub fn build_vm_spec(
     let guest_image_path = std::env::var_os("RKFORGE_SANDBOX_GUEST_IMAGE").map(PathBuf::from);
     let kernel_path = std::env::var_os("RKFORGE_SANDBOX_KERNEL").map(PathBuf::from);
     let initrd_path = std::env::var_os("RKFORGE_SANDBOX_INITRD").map(PathBuf::from);
+    debug!(
+        sandbox_id=%sandbox_id,
+        root=%root.display(),
+        image=%image,
+        cpus,
+        memory_mib,
+        persistent,
+        ?vmm_kind,
+        guest_image=?guest_image_path,
+        kernel=?kernel_path,
+        initrd=?initrd_path,
+        "building vm instance spec"
+    );
     VmInstanceSpec {
         sandbox_id: sandbox_id.to_string(),
         image: image.to_string(),
@@ -135,13 +162,181 @@ pub fn build_vm_spec(
 }
 
 pub fn run_shim_command(args: SandboxShimArgs) -> Result<()> {
+    debug!(spec_path=%args.spec.display(), "running sandbox-shim command");
     let bytes = fs::read(&args.spec)
         .with_context(|| format!("failed to read shim spec {}", args.spec.display()))?;
     let spec: VmInstanceSpec =
         serde_json::from_slice(&bytes).with_context(|| "failed to parse shim spec")?;
+    debug!(sandbox_id=%spec.sandbox_id, ?spec.vmm_kind, "parsed shim vm spec");
 
-    match spec.vmm_kind {
+    let result = match spec.vmm_kind {
         VmmKind::Firecracker => firecracker::run_firecracker_shim(spec),
         VmmKind::Libkrun => libkrun::run_libkrun_shim(spec),
+    };
+
+    if let Err(err) = &result {
+        let _ = write_shim_failure(args.spec.parent().unwrap_or_else(|| Path::new(".")), err);
     }
+
+    result
+}
+
+pub fn shim_log_path(work_dir: &Path) -> PathBuf {
+    work_dir.join(SHIM_LOG_FILE)
+}
+
+pub fn shim_failure_path(work_dir: &Path) -> PathBuf {
+    work_dir.join(SHIM_FAILURE_FILE)
+}
+
+pub fn load_shim_failure(work_dir: &Path) -> Result<Option<ShimFailure>> {
+    let path = shim_failure_path(work_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let bytes = fs::read(&path)
+        .with_context(|| format!("failed to read shim failure {}", path.display()))?;
+    let failure = serde_json::from_slice(&bytes).with_context(|| "failed to parse shim failure")?;
+    Ok(Some(failure))
+}
+
+pub fn write_shim_failure(work_dir: &Path, err: &anyhow::Error) -> Result<()> {
+    fs::create_dir_all(work_dir).with_context(|| {
+        format!(
+            "failed to create shim work directory {}",
+            work_dir.display()
+        )
+    })?;
+    let path = shim_failure_path(work_dir);
+    let failure = ShimFailure {
+        error: format!("{err:#}"),
+    };
+    fs::write(&path, serde_json::to_vec_pretty(&failure)?)
+        .with_context(|| format!("failed to write shim failure {}", path.display()))?;
+    append_log_message(
+        &Arc::new(Mutex::new(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(shim_log_path(work_dir))
+                .with_context(|| {
+                    format!(
+                        "failed to open shim log {}",
+                        shim_log_path(work_dir).display()
+                    )
+                })?,
+        )),
+        &format!("\n===== sandbox-shim failure =====\n{}\n", failure.error),
+    );
+    Ok(())
+}
+
+pub fn spawn_shim_process(shim_binary: &Path, spec_path: &Path, work_dir: &Path) -> Result<u32> {
+    fs::create_dir_all(work_dir).with_context(|| {
+        format!(
+            "failed to create shim work directory {}",
+            work_dir.display()
+        )
+    })?;
+
+    let log_path = shim_log_path(work_dir);
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("failed to open shim log {}", log_path.display()))?;
+    let shared_log = Arc::new(Mutex::new(log_file));
+    let inherit_terminal = env_flag(SHIM_INHERIT_STDIO_ENV);
+    debug!(
+        shim_binary=%shim_binary.display(),
+        spec_path=%spec_path.display(),
+        work_dir=%work_dir.display(),
+        log_path=%log_path.display(),
+        inherit_terminal,
+        "spawning sandbox shim process"
+    );
+
+    let mut child = Command::new(shim_binary)
+        .arg("sandbox-shim")
+        .arg("--spec")
+        .arg(spec_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn sandbox shim via {}", shim_binary.display()))?;
+
+    let child_id = child.id();
+    append_log_message(
+        &shared_log,
+        &format!(
+            "\n===== spawned sandbox-shim pid={child_id} spec={} =====\n",
+            spec_path.display()
+        ),
+    );
+
+    if let Some(stdout) = child.stdout.take() {
+        spawn_shim_output_pump(stdout, shared_log.clone(), inherit_terminal, false);
+    }
+    if let Some(stderr) = child.stderr.take() {
+        spawn_shim_output_pump(stderr, shared_log.clone(), inherit_terminal, true);
+    }
+
+    Ok(child_id)
+}
+
+fn env_flag(key: &str) -> bool {
+    matches!(
+        std::env::var(key).ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
+
+fn append_log_message(log: &Arc<Mutex<std::fs::File>>, message: &str) {
+    if let Ok(mut file) = log.lock() {
+        let _ = file.write_all(message.as_bytes());
+        let _ = file.flush();
+    }
+}
+
+fn spawn_shim_output_pump<R>(
+    mut reader: R,
+    log: Arc<Mutex<std::fs::File>>,
+    inherit_terminal: bool,
+    is_stderr: bool,
+) where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut buf = [0_u8; 8192];
+        loop {
+            let read = match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(err) => {
+                    append_log_message(&log, &format!("\n[shim stream read error] {err}\n"));
+                    break;
+                }
+            };
+            let chunk = &buf[..read];
+
+            if let Ok(mut file) = log.lock() {
+                let _ = file.write_all(chunk);
+                let _ = file.flush();
+            }
+
+            if inherit_terminal {
+                if is_stderr {
+                    let mut stderr = std::io::stderr().lock();
+                    let _ = stderr.write_all(chunk);
+                    let _ = stderr.flush();
+                } else {
+                    let mut stdout = std::io::stdout().lock();
+                    let _ = stdout.write_all(chunk);
+                    let _ = stdout.flush();
+                }
+            }
+        }
+    });
 }

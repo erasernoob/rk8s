@@ -1,6 +1,9 @@
 use crate::sandbox::protocol::GuestReadyEvent;
 use crate::sandbox::read_message;
-use crate::sandbox::vm::{VmBackend, VmInstanceHandle, VmInstanceSpec, VmmKind};
+use crate::sandbox::vm::{
+    VmBackend, VmInstanceHandle, VmInstanceSpec, VmmKind, load_shim_failure, shim_failure_path,
+    shim_log_path, spawn_shim_process,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use libloading::Library;
@@ -13,21 +16,24 @@ use std::os::raw::{c_char, c_int};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 const DEFAULT_BOOT_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const KRUN_KERNEL_FORMAT_RAW: u32 = 0;
+const GUEST_RKFORGE_PATH: &str = "/usr/local/bin/rkforge";
 
 type KrunCreateCtxFn = unsafe extern "C" fn() -> c_int;
 type KrunSetVmConfigFn = unsafe extern "C" fn(u32, u8, u32) -> c_int;
 type KrunSetKernelFn =
     unsafe extern "C" fn(u32, *const c_char, u32, *const c_char, *const c_char) -> c_int;
-type KrunAddDiskFn =
-    unsafe extern "C" fn(u32, *const c_char, *const c_char, bool) -> c_int;
+type KrunSetWorkdirFn = unsafe extern "C" fn(u32, *const c_char) -> c_int;
+type KrunSetExecFn =
+    unsafe extern "C" fn(u32, *const c_char, *const *const c_char, *const *const c_char) -> c_int;
+type KrunAddDiskFn = unsafe extern "C" fn(u32, *const c_char, *const c_char, bool) -> c_int;
 type KrunSetRootDiskRemountFn =
     unsafe extern "C" fn(u32, *const c_char, *const c_char, *const c_char) -> c_int;
 type KrunAddVsockPort2Fn = unsafe extern "C" fn(u32, u32, *const c_char, bool) -> c_int;
@@ -96,27 +102,24 @@ impl LibkrunVmBackend {
     }
 
     fn spawn_shim(&self, spec_path: &Path) -> Result<u32> {
-        let child = Command::new(&self.shim_binary)
-            .arg("sandbox-shim")
-            .arg("--spec")
-            .arg(spec_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "failed to spawn sandbox shim via {}",
-                    self.shim_binary.display()
-                )
-            })?;
-        Ok(child.id())
+        let work_dir = spec_path
+            .parent()
+            .ok_or_else(|| anyhow!("shim spec path has no parent: {}", spec_path.display()))?;
+        spawn_shim_process(&self.shim_binary, spec_path, work_dir)
     }
 }
 
 #[async_trait]
 impl VmBackend for LibkrunVmBackend {
     async fn boot(&self, spec: &VmInstanceSpec) -> Result<VmInstanceHandle> {
+        debug!(
+            sandbox_id=%spec.sandbox_id,
+            work_dir=%spec.work_dir.display(),
+            guest_image=?spec.guest_image_path,
+            kernel=?spec.kernel_path,
+            initrd=?spec.initrd_path,
+            "booting libkrun vm"
+        );
         validate_vm_spec(spec)?;
         fs::create_dir_all(&spec.work_dir)
             .with_context(|| format!("failed to create {}", spec.work_dir.display()))?;
@@ -125,10 +128,19 @@ impl VmBackend for LibkrunVmBackend {
         self.save_spec(spec)?;
 
         let shim_pid = self.spawn_shim(&self.spec_path(&spec.sandbox_id))?;
+        debug!(sandbox_id=%spec.sandbox_id, shim_pid, "spawned libkrun shim");
         let runtime_state = wait_for_runtime_state(
             &self.runtime_state_path(&spec.sandbox_id),
+            &spec.work_dir,
             self.boot_timeout,
         )?;
+        debug!(
+            sandbox_id=%spec.sandbox_id,
+            vmm_pid=runtime_state.vmm_pid,
+            libkrun_library=?runtime_state.libkrun_library,
+            libkrunfw_path=?runtime_state.libkrunfw_path,
+            "received libkrun runtime state"
+        );
 
         let handle = VmInstanceHandle {
             sandbox_id: spec.sandbox_id.clone(),
@@ -149,6 +161,12 @@ impl VmBackend for LibkrunVmBackend {
 
     async fn wait_ready(&self, handle: &VmInstanceHandle) -> Result<GuestReadyEvent> {
         let deadline = Instant::now() + self.boot_timeout;
+        debug!(
+            sandbox_id=%handle.sandbox_id,
+            ready_file=%handle.ready_file.display(),
+            timeout_secs=self.boot_timeout.as_secs(),
+            "waiting for libkrun guest ready event"
+        );
         while Instant::now() < deadline {
             if handle.ready_file.exists() {
                 let bytes = fs::read(&handle.ready_file).with_context(|| {
@@ -156,10 +174,32 @@ impl VmBackend for LibkrunVmBackend {
                 })?;
                 let event: GuestReadyEvent = serde_json::from_slice(&bytes)
                     .with_context(|| "failed to parse guest ready event")?;
+                debug!(
+                    sandbox_id=%handle.sandbox_id,
+                    stage=?event.stage,
+                    transport=%event.transport,
+                    "received libkrun guest ready event"
+                );
                 return Ok(event);
+            }
+            if let Some(failure) = load_shim_failure(&handle.work_dir)? {
+                warn!(
+                    sandbox_id=%handle.sandbox_id,
+                    error=%failure.error,
+                    "libkrun shim failed before guest ready"
+                );
+                return Err(anyhow!(
+                    "sandbox shim failed before guest ready: {}",
+                    failure.error
+                ));
             }
             tokio::time::sleep(DEFAULT_POLL_INTERVAL).await;
         }
+        warn!(
+            sandbox_id=%handle.sandbox_id,
+            ready_file=%handle.ready_file.display(),
+            "timed out waiting for libkrun guest ready event"
+        );
         Err(anyhow!(
             "timed out waiting for guest ready signal for sandbox {}",
             handle.sandbox_id
@@ -167,6 +207,12 @@ impl VmBackend for LibkrunVmBackend {
     }
 
     async fn stop(&self, handle: &VmInstanceHandle) -> Result<()> {
+        debug!(
+            sandbox_id=%handle.sandbox_id,
+            pid=?handle.pid,
+            shim_pid=?handle.shim_pid,
+            "sending stop signals to libkrun vm"
+        );
         if let Some(pid) = handle.pid {
             let _ = signal::kill(Pid::from_raw(pid as i32), signal::Signal::SIGTERM);
         }
@@ -198,10 +244,17 @@ struct RuntimeState {
 }
 
 pub fn run_libkrun_shim(spec: VmInstanceSpec) -> Result<()> {
+    debug!(
+        sandbox_id=%spec.sandbox_id,
+        work_dir=%spec.work_dir.display(),
+        guest_image=?spec.guest_image_path,
+        kernel=?spec.kernel_path,
+        initrd=?spec.initrd_path,
+        "starting libkrun shim"
+    );
     validate_vm_spec(&spec)?;
     fs::create_dir_all(&spec.work_dir)
         .with_context(|| format!("failed to create {}", spec.work_dir.display()))?;
-    cleanup_runtime_paths(&spec)?;
     fs::write(
         spec.work_dir.join("shim.pid"),
         std::process::id().to_string(),
@@ -209,6 +262,12 @@ pub fn run_libkrun_shim(spec: VmInstanceSpec) -> Result<()> {
 
     let libkrun_library = find_libkrun_library();
     let libkrunfw_path = resolve_libkrunfw_path(&spec, libkrun_library.as_deref())?;
+    debug!(
+        sandbox_id=%spec.sandbox_id,
+        libkrun_library=?libkrun_library,
+        libkrunfw_path=?libkrunfw_path,
+        "resolved libkrun runtime assets"
+    );
     configure_runtime_library_path(libkrun_library.as_deref(), libkrunfw_path.as_deref())?;
 
     let shim_state = ShimState {
@@ -236,18 +295,34 @@ pub fn run_libkrun_shim(spec: VmInstanceSpec) -> Result<()> {
     }
 
     let symbols = unsafe { LibkrunSymbols::load(libkrun_library.as_deref()) }?;
+    debug!(sandbox_id=%spec.sandbox_id, "loaded libkrun shared library symbols");
     let ctx = unsafe { configure_ctx(&symbols, &spec) }?;
+    debug!(sandbox_id=%spec.sandbox_id, ctx, "configured libkrun context");
     let rc = unsafe { (symbols.start_enter)(ctx) };
     if rc < 0 {
         bail!("krun_start_enter failed with errno {}", -rc);
     }
+    debug!(sandbox_id=%spec.sandbox_id, "libkrun context entered guest execution");
     Ok(())
 }
 
 unsafe fn configure_ctx(symbols: &LibkrunSymbols, spec: &VmInstanceSpec) -> Result<u32> {
     let ctx = unsafe { krun_call("krun_create_ctx", (symbols.create_ctx)())? as u32 };
-    let num_vcpus = u8::try_from(spec.cpus).map_err(|_| anyhow!("libkrun supports at most 255 vCPUs"))?;
-    unsafe { krun_call("krun_set_vm_config", (symbols.set_vm_config)(ctx, num_vcpus, spec.memory_mib))? };
+    let num_vcpus =
+        u8::try_from(spec.cpus).map_err(|_| anyhow!("libkrun supports at most 255 vCPUs"))?;
+    unsafe {
+        krun_call(
+            "krun_set_vm_config",
+            (symbols.set_vm_config)(ctx, num_vcpus, spec.memory_mib),
+        )?
+    };
+    debug!(
+        sandbox_id=%spec.sandbox_id,
+        ctx,
+        cpus=spec.cpus,
+        memory_mib=spec.memory_mib,
+        "configured libkrun vm config"
+    );
 
     if let Some(kernel_path) = &spec.kernel_path {
         let kernel_path = path_cstring(kernel_path)?;
@@ -273,12 +348,17 @@ unsafe fn configure_ctx(symbols: &LibkrunSymbols, spec: &VmInstanceSpec) -> Resu
                 ),
             )?
         };
+        debug!(
+            sandbox_id=%spec.sandbox_id,
+            kernel=%kernel_path.to_string_lossy(),
+            initrd=?spec.initrd_path,
+            "configured explicit libkrun kernel"
+        );
     }
 
-    let guest_image = spec
-        .guest_image_path
-        .as_ref()
-        .ok_or_else(|| anyhow!("RKFORGE_SANDBOX_GUEST_IMAGE must be configured for libkrun boot"))?;
+    let guest_image = spec.guest_image_path.as_ref().ok_or_else(|| {
+        anyhow!("RKFORGE_SANDBOX_GUEST_IMAGE must be configured for libkrun boot")
+    })?;
     let block_id = CString::new("rootfs").unwrap();
     let guest_image = path_cstring(guest_image)?;
     unsafe {
@@ -287,6 +367,7 @@ unsafe fn configure_ctx(symbols: &LibkrunSymbols, spec: &VmInstanceSpec) -> Resu
             (symbols.add_disk)(ctx, block_id.as_ptr(), guest_image.as_ptr(), false),
         )?
     };
+    debug!(sandbox_id=%spec.sandbox_id, ctx, "configured libkrun root disk");
 
     let guest_device = CString::new("/dev/vda").unwrap();
     let fstype = CString::new("ext4").unwrap();
@@ -302,6 +383,7 @@ unsafe fn configure_ctx(symbols: &LibkrunSymbols, spec: &VmInstanceSpec) -> Resu
             ),
         )?
     };
+    debug!(sandbox_id=%spec.sandbox_id, ctx, "configured libkrun root disk remount");
 
     let ready_socket = path_cstring(&spec.ready_socket_path)?;
     unsafe {
@@ -310,6 +392,13 @@ unsafe fn configure_ctx(symbols: &LibkrunSymbols, spec: &VmInstanceSpec) -> Resu
             (symbols.add_vsock_port2)(ctx, spec.ready_vsock_port, ready_socket.as_ptr(), false),
         )?
     };
+    debug!(
+        sandbox_id=%spec.sandbox_id,
+        ctx,
+        ready_vsock_port=spec.ready_vsock_port,
+        ready_socket=%spec.ready_socket_path.display(),
+        "configured libkrun ready vsock bridge"
+    );
 
     let agent_socket = path_cstring(&spec.agent_socket_path)?;
     unsafe {
@@ -318,8 +407,68 @@ unsafe fn configure_ctx(symbols: &LibkrunSymbols, spec: &VmInstanceSpec) -> Resu
             (symbols.add_vsock_port2)(ctx, spec.agent_vsock_port, agent_socket.as_ptr(), true),
         )?
     };
+    debug!(
+        sandbox_id=%spec.sandbox_id,
+        ctx,
+        agent_vsock_port=spec.agent_vsock_port,
+        agent_socket=%spec.agent_socket_path.display(),
+        "configured libkrun agent vsock bridge"
+    );
+
+    unsafe { configure_guest_entrypoint(symbols, spec, ctx)? };
 
     Ok(ctx)
+}
+
+unsafe fn configure_guest_entrypoint(
+    symbols: &LibkrunSymbols,
+    spec: &VmInstanceSpec,
+    ctx: u32,
+) -> Result<()> {
+    let workdir = CString::new("/").unwrap();
+    unsafe {
+        krun_call(
+            "krun_set_workdir",
+            (symbols.set_workdir)(ctx, workdir.as_ptr()),
+        )?
+    };
+
+    let exec_path = CString::new(GUEST_RKFORGE_PATH).unwrap();
+    let argv_storage = vec![
+        CString::new("sandbox-agent").unwrap(),
+        CString::new("--vsock-port").unwrap(),
+        CString::new(spec.agent_vsock_port.to_string()).unwrap(),
+        CString::new("--ready-vsock-port").unwrap(),
+        CString::new(spec.ready_vsock_port.to_string()).unwrap(),
+        CString::new("--sandbox-id").unwrap(),
+        CString::new(spec.sandbox_id.as_str()).context("sandbox id contains interior NUL")?,
+    ];
+    let mut argv_ptrs: Vec<*const c_char> = argv_storage.iter().map(|arg| arg.as_ptr()).collect();
+    argv_ptrs.push(std::ptr::null());
+
+    let env_ptrs = [std::ptr::null()];
+    unsafe {
+        krun_call(
+            "krun_set_exec",
+            (symbols.set_exec)(
+                ctx,
+                exec_path.as_ptr(),
+                argv_ptrs.as_ptr(),
+                env_ptrs.as_ptr(),
+            ),
+        )?
+    };
+    debug!(
+        sandbox_id=%spec.sandbox_id,
+        ctx,
+        exec_path=GUEST_RKFORGE_PATH,
+        workdir="/",
+        agent_vsock_port=spec.agent_vsock_port,
+        ready_vsock_port=spec.ready_vsock_port,
+        "configured libkrun guest entrypoint"
+    );
+
+    Ok(())
 }
 
 unsafe fn krun_call(name: &str, rc: c_int) -> Result<c_int> {
@@ -337,9 +486,16 @@ fn cleanup_runtime_paths(spec: &VmInstanceSpec) -> Result<()> {
         spec.work_dir.join("runtime-state.json"),
         spec.work_dir.join("shim.pid"),
         spec.work_dir.join("shim-state.json"),
+        shim_failure_path(&spec.work_dir),
+        shim_log_path(&spec.work_dir),
     ];
     for path in paths {
         if path.exists() {
+            debug!(
+                sandbox_id=%spec.sandbox_id,
+                path=%path.display(),
+                "cleaning stale libkrun runtime path"
+            );
             if path.is_dir() {
                 fs::remove_dir_all(&path)?;
             } else {
@@ -364,25 +520,36 @@ fn validate_vm_spec(spec: &VmInstanceSpec) -> Result<()> {
     if spec.initrd_path.is_some() && spec.kernel_path.is_none() {
         bail!("RKFORGE_SANDBOX_INITRD requires RKFORGE_SANDBOX_KERNEL for libkrun boot");
     }
-    let guest_image = spec
-        .guest_image_path
-        .as_ref()
-        .ok_or_else(|| anyhow!("RKFORGE_SANDBOX_GUEST_IMAGE must be configured for libkrun boot"))?;
+    let guest_image = spec.guest_image_path.as_ref().ok_or_else(|| {
+        anyhow!("RKFORGE_SANDBOX_GUEST_IMAGE must be configured for libkrun boot")
+    })?;
     if !guest_image.exists() {
         bail!("guest image path does not exist: {}", guest_image.display());
     }
     Ok(())
 }
 
-fn wait_for_runtime_state(path: &Path, timeout: Duration) -> Result<RuntimeState> {
+fn wait_for_runtime_state(path: &Path, work_dir: &Path, timeout: Duration) -> Result<RuntimeState> {
     let deadline = Instant::now() + timeout;
+    debug!(
+        path=%path.display(),
+        timeout_secs=timeout.as_secs(),
+        "waiting for libkrun runtime state file"
+    );
     while Instant::now() < deadline {
         if path.exists() {
             let bytes =
                 fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
             let state: RuntimeState =
                 serde_json::from_slice(&bytes).with_context(|| "failed to parse runtime state")?;
+            debug!(path=%path.display(), vmm_pid=state.vmm_pid, "loaded libkrun runtime state");
             return Ok(state);
+        }
+        if let Some(failure) = load_shim_failure(work_dir)? {
+            return Err(anyhow!(
+                "sandbox shim failed before runtime state was written: {}",
+                failure.error
+            ));
         }
         std::thread::sleep(DEFAULT_POLL_INTERVAL);
     }
@@ -393,14 +560,12 @@ fn wait_for_runtime_state(path: &Path, timeout: Duration) -> Result<RuntimeState
 }
 
 fn default_boot_args(spec: &VmInstanceSpec) -> String {
-    spec.boot_args
-        .clone()
-        .unwrap_or_else(|| {
-            format!(
-                "console=ttyS0 reboot=k panic=1 rkforge.sandbox_id={}",
-                spec.sandbox_id
-            )
-        })
+    spec.boot_args.clone().unwrap_or_else(|| {
+        format!(
+            "console=ttyS0 reboot=k panic=1 rkforge.sandbox_id={}",
+            spec.sandbox_id
+        )
+    })
 }
 
 fn spawn_ready_listener(spec: &VmInstanceSpec) -> Result<()> {
@@ -411,11 +576,24 @@ fn spawn_ready_listener(spec: &VmInstanceSpec) -> Result<()> {
         )
     })?;
     let ready_file = spec.ready_file.clone();
+    let sandbox_id = spec.sandbox_id.clone();
+    debug!(
+        sandbox_id=%sandbox_id,
+        ready_socket=%spec.ready_socket_path.display(),
+        ready_file=%ready_file.display(),
+        "spawned libkrun ready listener"
+    );
     thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept()
             && let Ok(event) = read_message::<GuestReadyEvent>(&mut stream)
             && let Ok(bytes) = serde_json::to_vec_pretty(&event)
         {
+            debug!(
+                sandbox_id=%sandbox_id,
+                stage=?event.stage,
+                transport=%event.transport,
+                "libkrun ready listener received event"
+            );
             let _ = fs::write(&ready_file, bytes);
         }
     });
@@ -461,17 +639,25 @@ fn configure_runtime_library_path(
     if let Some(current) = std::env::var_os("LD_LIBRARY_PATH") {
         dirs.extend(std::env::split_paths(&current));
     }
-    let joined = std::env::join_paths(dirs)
-        .context("failed to compose LD_LIBRARY_PATH for libkrun shim")?;
+    let joined =
+        std::env::join_paths(dirs).context("failed to compose LD_LIBRARY_PATH for libkrun shim")?;
     // SAFETY: the shim updates its own environment before spawning any helper threads or loading
     // libkrun, matching Boxlite's approach of setting runtime search paths in the shim process.
     unsafe {
         std::env::set_var("LD_LIBRARY_PATH", joined);
     }
+    debug!(
+        libkrun_library=?libkrun_library,
+        libkrunfw_path=?libkrunfw_path,
+        "configured shim LD_LIBRARY_PATH for libkrun assets"
+    );
     Ok(())
 }
 
-fn resolve_libkrunfw_path(spec: &VmInstanceSpec, libkrun_library: Option<&Path>) -> Result<Option<PathBuf>> {
+fn resolve_libkrunfw_path(
+    spec: &VmInstanceSpec,
+    libkrun_library: Option<&Path>,
+) -> Result<Option<PathBuf>> {
     if spec.kernel_path.is_some() {
         return Ok(find_libkrunfw_path(libkrun_library));
     }
@@ -572,6 +758,8 @@ struct LibkrunSymbols {
     create_ctx: KrunCreateCtxFn,
     set_vm_config: KrunSetVmConfigFn,
     set_kernel: KrunSetKernelFn,
+    set_workdir: KrunSetWorkdirFn,
+    set_exec: KrunSetExecFn,
     add_disk: KrunAddDiskFn,
     set_root_disk_remount: KrunSetRootDiskRemountFn,
     add_vsock_port2: KrunAddVsockPort2Fn,
@@ -616,6 +804,12 @@ impl LibkrunSymbols {
                 set_kernel: *library
                     .get(b"krun_set_kernel\0")
                     .context("failed to resolve krun_set_kernel")?,
+                set_workdir: *library
+                    .get(b"krun_set_workdir\0")
+                    .context("failed to resolve krun_set_workdir")?,
+                set_exec: *library
+                    .get(b"krun_set_exec\0")
+                    .context("failed to resolve krun_set_exec")?,
                 add_disk: *library
                     .get(b"krun_add_disk\0")
                     .context("failed to resolve krun_add_disk")?,

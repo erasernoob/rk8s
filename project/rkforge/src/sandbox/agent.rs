@@ -7,8 +7,10 @@ use std::io::{Read, Write};
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use tracing::{debug, warn};
 
 #[derive(Debug, Args, Clone)]
 pub struct SandboxAgentArgs {
@@ -25,6 +27,12 @@ pub fn run_command(args: SandboxAgentArgs) -> Result<()> {
 }
 
 fn run_vsock_agent(args: SandboxAgentArgs) -> Result<()> {
+    debug!(
+        sandbox_id=args.sandbox_id.as_deref().unwrap_or("unknown"),
+        vsock_port=args.vsock_port,
+        ready_vsock_port=?args.ready_vsock_port,
+        "starting sandbox guest agent"
+    );
     let listener = VsockListener::bind(args.vsock_port)?;
     if let Some(ready_vsock_port) = args.ready_vsock_port {
         notify_host_ready(
@@ -35,7 +43,9 @@ fn run_vsock_agent(args: SandboxAgentArgs) -> Result<()> {
     }
     loop {
         let mut stream = listener.accept()?;
+        debug!("accepted guest agent client connection");
         if let Err(err) = handle_client(&mut stream) {
+            warn!(error=%err, "sandbox agent failed to handle client");
             let response = GuestExecResponse {
                 request_id: String::new(),
                 stdout: String::new(),
@@ -48,6 +58,10 @@ fn run_vsock_agent(args: SandboxAgentArgs) -> Result<()> {
 }
 
 fn notify_host_ready(sandbox_id: &str, agent_vsock_port: u32, ready_vsock_port: u32) -> Result<()> {
+    debug!(
+        sandbox_id,
+        agent_vsock_port, ready_vsock_port, "notifying host that guest agent is ready"
+    );
     let mut stream = VsockStream::connect(libc::VMADDR_CID_HOST, ready_vsock_port)?;
     let event = GuestReadyEvent {
         sandbox_id: sandbox_id.to_string(),
@@ -63,6 +77,15 @@ fn notify_host_ready(sandbox_id: &str, agent_vsock_port: u32, ready_vsock_port: 
 
 fn handle_client(stream: &mut VsockStream) -> Result<()> {
     let request: GuestExecRequest = read_message(stream)?;
+    debug!(
+        sandbox_id=%request.sandbox_id,
+        request_id=%request.request_id,
+        command=%request.command,
+        args=?request.args,
+        timeout_secs=?request.timeout_secs,
+        inline_code=request.inline_code.is_some(),
+        "sandbox agent received exec request"
+    );
     let response = execute_request(request);
     write_message(stream, &response)?;
     stream.flush()?;
@@ -82,21 +105,21 @@ fn execute_request(request: GuestExecRequest) -> GuestExecResponse {
 }
 
 fn execute_request_inner(request: &GuestExecRequest) -> Result<GuestExecResponse> {
-    let mut command = if let Some(code) = request.inline_code.as_ref() {
+    let executable = if request.inline_code.is_some() {
         let language = request.language.as_deref().unwrap_or("python");
         match language {
-            "python" => {
-                let mut cmd = Command::new("python3");
-                cmd.arg("-c").arg(code);
-                cmd
-            }
+            "python" => resolve_python_executable().to_string(),
             other => bail!("unsupported inline language `{other}`"),
         }
     } else {
-        let mut cmd = Command::new(&request.command);
-        cmd.args(&request.args);
-        cmd
+        request.command.clone()
     };
+    let mut command = Command::new(&executable);
+    if let Some(code) = request.inline_code.as_ref() {
+        command.arg("-c").arg(code);
+    } else {
+        command.args(&request.args);
+    }
 
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
@@ -104,7 +127,14 @@ fn execute_request_inner(request: &GuestExecRequest) -> Result<GuestExecResponse
 
     let mut child = command
         .spawn()
-        .with_context(|| format!("failed to spawn command `{}`", request.command))?;
+        .with_context(|| format!("failed to spawn command `{executable}`"))?;
+    debug!(
+        sandbox_id=%request.sandbox_id,
+        request_id=%request.request_id,
+        command=%executable,
+        pid=?child.id(),
+        "spawned guest command"
+    );
 
     let status = if let Some(timeout_secs) = request.timeout_secs {
         wait_with_timeout(&mut child, Duration::from_secs(timeout_secs))?
@@ -123,13 +153,17 @@ fn execute_request_inner(request: &GuestExecRequest) -> Result<GuestExecResponse
     })
 }
 
-fn wait_with_timeout(child: &mut std::process::Child, timeout: Duration) -> Result<std::process::ExitStatus> {
+fn wait_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus> {
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(status);
         }
         if Instant::now() >= deadline {
+            warn!(timeout_secs=timeout.as_secs(), pid=?child.id(), "guest command timed out");
             let _ = child.kill();
             let status = child.wait()?;
             return Ok(status);
@@ -142,6 +176,23 @@ fn exit_code(status: &std::process::ExitStatus) -> i32 {
     status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or_default())
+}
+
+fn resolve_python_executable() -> &'static str {
+    const CANDIDATES: [&str; 4] = [
+        "/usr/local/bin/python3",
+        "/usr/bin/python3",
+        "/bin/python3",
+        "python3",
+    ];
+
+    for candidate in CANDIDATES {
+        if candidate == "python3" || Path::new(candidate).is_file() {
+            return candidate;
+        }
+    }
+
+    "python3"
 }
 
 struct VsockListener {
@@ -182,13 +233,21 @@ impl VsockListener {
                 .with_context(|| format!("failed to listen on vsock port {}", port));
         }
 
+        debug!(port, "sandbox agent bound vsock listener");
         Ok(Self { fd })
     }
 
     fn accept(&self) -> Result<VsockStream> {
-        let fd = unsafe { libc::accept(self.fd.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut()) };
+        let fd = unsafe {
+            libc::accept(
+                self.fd.as_raw_fd(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
         if fd < 0 {
-            return Err(std::io::Error::last_os_error()).context("failed to accept vsock connection");
+            return Err(std::io::Error::last_os_error())
+                .context("failed to accept vsock connection");
         }
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         Ok(VsockStream { fd })
@@ -227,6 +286,7 @@ impl VsockStream {
                 .with_context(|| format!("failed to connect to vsock {}:{}", cid, port));
         }
 
+        debug!(cid, port, "connected vsock stream");
         Ok(Self { fd })
     }
 }
