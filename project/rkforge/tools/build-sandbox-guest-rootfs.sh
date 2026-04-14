@@ -7,11 +7,11 @@ Usage:
   build-sandbox-guest-rootfs.sh --rootfs-dir DIR --output IMG [--rkforge-bin BIN]
   build-sandbox-guest-rootfs.sh --rootfs-tar TAR --output IMG [--rkforge-bin BIN]
 
-Build an ext4 guest image suitable for libkrun by injecting rkforge as both:
+Build an ext4 guest image suitable for libkrun by injecting rkforge at:
   - /usr/local/bin/rkforge
-  - /sbin/init
 
-The resulting guest boots directly into `rkforge sandbox-agent`.
+The resulting guest rootfs can be used with libkrun's built-in init plus
+`krun_set_exec(...)` to launch `rkforge sandbox-agent` inside the guest.
 
 Requirements:
   - mkfs.ext4 with `-d`
@@ -94,11 +94,10 @@ else
   cp -a "$ROOTFS_DIR"/. "$staging"/
 fi
 
-mkdir -p "$staging/usr/local/bin" "$staging/sbin" "$staging/proc" "$staging/sys" "$staging/dev" "$staging/run" "$staging/tmp"
+mkdir -p "$staging/usr/local/bin" "$staging/proc" "$staging/sys" "$staging/dev" "$staging/run" "$staging/tmp"
 install -m 0755 "$RKFORGE_BIN" "$staging/usr/local/bin/rkforge"
-install -m 0755 "$RKFORGE_BIN" "$staging/sbin/init"
 
-if [[ ! -x "$staging/usr/bin/python3" && ! -x "$staging/bin/python3" ]]; then
+if [[ ! -x "$staging/usr/bin/python3" && ! -x "$staging/bin/python3" && ! -x "$staging/usr/local/bin/python3" ]]; then
   echo "warning: python3 was not found in the guest rootfs; sandbox exec_python will fail until Python is installed" >&2
 fi
 
