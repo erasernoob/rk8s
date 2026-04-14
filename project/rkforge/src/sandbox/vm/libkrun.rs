@@ -434,7 +434,7 @@ unsafe fn configure_guest_entrypoint(
     };
 
     let exec_path = CString::new(GUEST_RKFORGE_PATH).unwrap();
-    let argv_storage = vec![
+    let argv_storage = [
         CString::new("sandbox-agent").unwrap(),
         CString::new("--vsock-port").unwrap(),
         CString::new(spec.agent_vsock_port.to_string()).unwrap(),
