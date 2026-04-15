@@ -1,4 +1,5 @@
 use crate::sandbox::protocol::{GuestReadyEvent, ReadyStage};
+use crate::sandbox::runtime_assets::RuntimeAssetBundle;
 use crate::sandbox::vm::{
     VmBackend, VmInstanceHandle, VmInstanceSpec, VmmKind, load_shim_failure, shim_failure_path,
     shim_log_path, spawn_shim_process,
@@ -32,9 +33,8 @@ pub struct FirecrackerVmBackend {
 
 impl FirecrackerVmBackend {
     pub fn new(root: PathBuf) -> Result<Self> {
-        let shim_binary = std::env::var_os("RKFORGE_SANDBOX_SHIM_BIN")
-            .map(PathBuf::from)
-            .unwrap_or(std::env::current_exe().context("failed to resolve current executable")?);
+        let assets = RuntimeAssetBundle::prepare(&root)?;
+        let shim_binary = assets.rkforge_binary().to_path_buf();
         let firecracker_binary = find_firecracker_binary().ok_or_else(|| {
             anyhow!("failed to locate firecracker binary; set RKFORGE_FIRECRACKER_BIN")
         })?;
@@ -512,12 +512,22 @@ fn terminate_child(child: &mut Child) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::vm::build_vm_spec;
     use tempfile::tempdir;
 
     #[test]
     fn build_vm_spec_uses_fixed_guest_paths() {
         let dir = tempdir().unwrap();
-        let spec = build_vm_spec(dir.path(), "demo", "python:3.12-slim", 1, 256, false);
+        let spec = build_vm_spec(
+            dir.path(),
+            "demo",
+            "python:3.12-slim",
+            1,
+            256,
+            false,
+            VmmKind::Firecracker,
+        )
+        .unwrap();
         assert_eq!(spec.sandbox_id, "demo");
         assert!(spec.work_dir.ends_with("demo"));
         assert!(spec.ready_file.ends_with("guest-ready.json"));

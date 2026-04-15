@@ -98,10 +98,14 @@ fn main() -> Result<()> {
             container::run_container(&args.container_yaml, args.volumes, args.device)
         }
         Commands::Save(args) => images::save_image(args),
+
+        // Sandbox related command
         Commands::Sandbox(cmd) => sandbox::cli::execute(cmd),
+        // TODO: Consider **Decouple** the shim,guestInit with rkforge main binary in the future
         Commands::SandboxShim(args) => sandbox::vm::run_shim_command(args),
         Commands::SandboxAgent(args) => sandbox::agent::run_command(args),
         Commands::SandboxGuestInit(args) => sandbox::guest::run_command(args),
+
         Commands::Start(args) => container::start_container(&args.container_name),
         Commands::State(args) => container::state_container(&args.container_name),
         Commands::Tag(args) => images::tag_image(args),

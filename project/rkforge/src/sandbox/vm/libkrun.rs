@@ -1,5 +1,8 @@
 use crate::sandbox::protocol::GuestReadyEvent;
 use crate::sandbox::read_message;
+use crate::sandbox::runtime_assets::{
+    RuntimeAssetBundle, discover_libkrun_library, discover_libkrunfw_path,
+};
 use crate::sandbox::vm::{
     VmBackend, VmInstanceHandle, VmInstanceSpec, VmmKind, load_shim_failure, shim_failure_path,
     shim_log_path, spawn_shim_process,
@@ -48,9 +51,8 @@ pub struct LibkrunVmBackend {
 
 impl LibkrunVmBackend {
     pub fn new(root: PathBuf) -> Result<Self> {
-        let shim_binary = std::env::var_os("RKFORGE_SANDBOX_SHIM_BIN")
-            .map(PathBuf::from)
-            .unwrap_or(std::env::current_exe().context("failed to resolve current executable")?);
+        let assets = RuntimeAssetBundle::prepare(&root)?;
+        let shim_binary = assets.rkforge_binary().to_path_buf();
         Ok(Self {
             root,
             shim_binary,
@@ -123,6 +125,7 @@ impl VmBackend for LibkrunVmBackend {
         validate_vm_spec(spec)?;
         fs::create_dir_all(&spec.work_dir)
             .with_context(|| format!("failed to create {}", spec.work_dir.display()))?;
+
         cleanup_runtime_paths(spec)?;
         spawn_ready_listener(spec)?;
         self.save_spec(spec)?;
@@ -268,6 +271,7 @@ pub fn run_libkrun_shim(spec: VmInstanceSpec) -> Result<()> {
         libkrunfw_path=?libkrunfw_path,
         "resolved libkrun runtime assets"
     );
+
     configure_runtime_library_path(libkrun_library.as_deref(), libkrunfw_path.as_deref())?;
 
     let shim_state = ShimState {
@@ -294,6 +298,7 @@ pub fn run_libkrun_shim(spec: VmInstanceSpec) -> Result<()> {
         start_parent_watchdog(parent_pid);
     }
 
+    // start to link libkrun library to current shim process
     let symbols = unsafe { LibkrunSymbols::load(libkrun_library.as_deref()) }?;
     debug!(sandbox_id=%spec.sandbox_id, "loaded libkrun shared library symbols");
     let ctx = unsafe { configure_ctx(&symbols, &spec) }?;
@@ -433,6 +438,8 @@ unsafe fn configure_guest_entrypoint(
         )?
     };
 
+    // Set guest's exec_path using GUEST_RKFORGE_PATH
+    // Note: libkrun now only support use `krun_set_exec` to set init process
     let exec_path = CString::new(GUEST_RKFORGE_PATH).unwrap();
     let argv_storage = [
         CString::new("sandbox-agent").unwrap(),
@@ -529,6 +536,8 @@ fn validate_vm_spec(spec: &VmInstanceSpec) -> Result<()> {
     Ok(())
 }
 
+// Detect the runtime-state.json's existence, when the runtime-state.json is written to
+// specific path, then the shim process is start up successfully
 fn wait_for_runtime_state(path: &Path, work_dir: &Path, timeout: Duration) -> Result<RuntimeState> {
     let deadline = Instant::now() + timeout;
     debug!(
@@ -568,6 +577,7 @@ fn default_boot_args(spec: &VmInstanceSpec) -> String {
     })
 }
 
+// Create ready_listener from `ready_socket_path` at host end to make sure host get the ready signal
 fn spawn_ready_listener(spec: &VmInstanceSpec) -> Result<()> {
     let listener = UnixListener::bind(&spec.ready_socket_path).with_context(|| {
         format!(
@@ -605,6 +615,7 @@ fn path_cstring(path: &Path) -> Result<CString> {
         .with_context(|| format!("path contains an interior NUL byte: {}", path.display()))
 }
 
+// To prevent shim-process become a orphan process
 fn start_parent_watchdog(parent_pid: u32) {
     std::thread::spawn(move || {
         let parent = Pid::from_raw(parent_pid as i32);
@@ -621,6 +632,7 @@ fn start_parent_watchdog(parent_pid: u32) {
     });
 }
 
+// Make sure the `LD_LIBARY_PATH` is setted in advance
 fn configure_runtime_library_path(
     libkrun_library: Option<&Path>,
     libkrunfw_path: Option<&Path>,
@@ -642,7 +654,7 @@ fn configure_runtime_library_path(
     let joined =
         std::env::join_paths(dirs).context("failed to compose LD_LIBRARY_PATH for libkrun shim")?;
     // SAFETY: the shim updates its own environment before spawning any helper threads or loading
-    // libkrun, matching Boxlite's approach of setting runtime search paths in the shim process.
+    // libkrun.
     unsafe {
         std::env::set_var("LD_LIBRARY_PATH", joined);
     }
@@ -663,94 +675,29 @@ fn resolve_libkrunfw_path(
     }
     find_libkrunfw_path(libkrun_library).map(Some).ok_or_else(|| {
         anyhow!(
-            "libkrun boot requires either RKFORGE_SANDBOX_KERNEL or a discoverable libkrunfw asset; set RKFORGE_LIBKRUNFW_PATH or RKFORGE_LIBKRUNFW_DIR"
+            "libkrun boot requires either RKFORGE_SANDBOX_KERNEL or a discoverable libkrunfw asset in the sandbox runtime bundle or standard library locations"
         )
     })
 }
 
+// First will try to get library path by RuntimeAssetBundle.
+// If not, try the Env variable again
 fn find_libkrun_library() -> Option<PathBuf> {
-    if let Some(path) = env_file_path("RKFORGE_LIBKRUN_LIBRARY") {
-        return Some(path);
-    }
-    if let Some(dir) = env_dir_path("RKFORGE_LIBKRUN_DIR")
-        && let Some(path) = find_library_in_dir(&dir, &["libkrun.so"])
+    if let Ok(Some(bundle)) = RuntimeAssetBundle::discover_from_current_process()
+        && let Some(path) = bundle.libkrun_library()
     {
-        return Some(path);
+        return Some(path.to_path_buf());
     }
-    for dir in standard_library_dirs() {
-        if let Some(path) = find_library_in_dir(&dir, &["libkrun.so"]) {
-            return Some(path);
-        }
-    }
-    None
+    discover_libkrun_library()
 }
 
 fn find_libkrunfw_path(libkrun_library: Option<&Path>) -> Option<PathBuf> {
-    if let Some(path) = env_file_path("RKFORGE_LIBKRUNFW_PATH") {
-        return Some(path);
-    }
-    if let Some(dir) = env_dir_path("RKFORGE_LIBKRUNFW_DIR")
-        && let Some(path) = find_library_in_dir(&dir, &["libkrunfw.so"])
+    if let Ok(Some(bundle)) = RuntimeAssetBundle::discover_from_current_process()
+        && let Some(path) = bundle.libkrunfw_path()
     {
-        return Some(path);
+        return Some(path.to_path_buf());
     }
-    if let Some(dir) = libkrun_library.and_then(Path::parent)
-        && let Some(path) = find_library_in_dir(dir, &["libkrunfw.so"])
-    {
-        return Some(path);
-    }
-    for dir in standard_library_dirs() {
-        if let Some(path) = find_library_in_dir(&dir, &["libkrunfw.so"]) {
-            return Some(path);
-        }
-    }
-    None
-}
-
-fn env_file_path(key: &str) -> Option<PathBuf> {
-    let path = std::env::var_os(key).map(PathBuf::from)?;
-    path.is_file().then_some(path)
-}
-
-fn env_dir_path(key: &str) -> Option<PathBuf> {
-    let path = std::env::var_os(key).map(PathBuf::from)?;
-    path.is_dir().then_some(path)
-}
-
-fn standard_library_dirs() -> Vec<PathBuf> {
-    let mut dirs = vec![
-        PathBuf::from("/usr/local/lib64"),
-        PathBuf::from("/usr/local/lib"),
-        PathBuf::from("/usr/lib64"),
-        PathBuf::from("/usr/lib"),
-        PathBuf::from("/lib64"),
-        PathBuf::from("/lib"),
-    ];
-    if let Some(home) = dirs::home_dir() {
-        dirs.push(home.join(".local/lib64"));
-        dirs.push(home.join(".local/lib"));
-    }
-    dirs
-}
-
-fn find_library_in_dir(dir: &Path, prefixes: &[&str]) -> Option<PathBuf> {
-    for prefix in prefixes {
-        let direct = dir.join(prefix);
-        if direct.is_file() {
-            return Some(direct);
-        }
-    }
-
-    let entries = fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if prefixes.iter().any(|prefix| name.starts_with(prefix)) && path.is_file() {
-            return Some(path);
-        }
-    }
-    None
+    discover_libkrunfw_path(libkrun_library)
 }
 
 struct LibkrunSymbols {
@@ -767,6 +714,7 @@ struct LibkrunSymbols {
 }
 
 impl LibkrunSymbols {
+    // Multi-path fallback to load the libkrun path
     unsafe fn load(explicit_path: Option<&Path>) -> Result<Self> {
         let mut attempts = Vec::new();
 
@@ -779,6 +727,7 @@ impl LibkrunSymbols {
 
         let mut errors = Vec::new();
         for attempt in attempts {
+            // Library:new which represents `dlopen`
             let library = unsafe { Library::new(&attempt) };
             match library {
                 Ok(library) => return unsafe { Self::from_library(library) },
@@ -787,7 +736,7 @@ impl LibkrunSymbols {
         }
 
         bail!(
-            "failed to load libkrun shared library; set RKFORGE_LIBKRUN_LIBRARY or RKFORGE_LIBKRUN_DIR. attempts: {}",
+            "failed to load libkrun shared library from the sandbox runtime bundle or standard library locations. attempts: {}",
             errors.join("; ")
         )
     }
@@ -859,6 +808,6 @@ mod tests {
             ready_vsock_port: 26_951,
         };
         let err = validate_vm_spec(&spec).unwrap_err();
-        assert!(err.to_string().contains("RKFORGE_SANDBOX_GUEST_IMAGE"));
+        assert!(err.to_string().contains("guest image"));
     }
 }

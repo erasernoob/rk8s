@@ -69,6 +69,8 @@ pub fn execute(cmd: SandboxCommand) -> Result<()> {
     let runtime = SandboxRuntime::new()?;
 
     match cmd {
+        // Currently the create action only did the "Create" job, which will not start up sandbox
+        // in this stage sandbox's status will always be `creating` until User use 'Exec' command
         SandboxCommand::Create(args) => {
             let sandbox = runtime.create(SandboxOptions {
                 image: args.image,
@@ -88,8 +90,9 @@ pub fn execute(cmd: SandboxCommand) -> Result<()> {
                 .get(args.sandbox_id)?
                 .ok_or_else(|| anyhow!("sandbox not found"))?;
             let result = rt::block_on(async {
+                // Here we provide a quick start interface `--code` to let user run a python command directly
                 if let Some(code) = args.code {
-                    let mut request = ExecRequest::new(sandbox.id.clone(), "python3"); // TODO: change the default command "python3"  
+                    let mut request = ExecRequest::new(sandbox.id.clone(), "python3");
                     request.inline_code = Some(code);
                     request.language = Some("python".to_string());
                     request.timeout_secs = Some(args.timeout_secs);

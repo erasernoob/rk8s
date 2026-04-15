@@ -1,7 +1,9 @@
 pub mod agent;
 pub mod cli;
 pub mod guest;
+mod guest_image;
 pub mod protocol;
+mod runtime_assets;
 pub mod vm;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -189,7 +191,7 @@ impl SandboxBackend for MicroVmSandboxBackend {
             info.spec.memory_mib,
             info.spec.persistent,
             self.vmm_kind,
-        );
+        )?;
         debug!(
             sandbox_id=%info.id,
             work_dir=%spec.work_dir.display(),
@@ -611,6 +613,7 @@ impl SandboxBox {
             .ok_or_else(|| anyhow!("sandbox {} not found", self.id))
     }
 
+    // Update current sandbox's state and try to start sandbox by create and start inner backend
     pub async fn start(&self) -> Result<()> {
         let mut info = self.info()?;
         debug!(sandbox_id=%self.id, state=%info.state.to_string(), "starting sandbox");
@@ -675,7 +678,9 @@ impl SandboxBox {
             inline_code=request.inline_code.is_some(),
             "processing sandbox exec request"
         );
+
         self.start().await?;
+
         let mut info = self.info()?;
         info.state = SandboxState::Running;
         info.updated_at = Utc::now();

@@ -1,3 +1,4 @@
+use crate::sandbox::guest_image::GuestImageManager;
 use crate::sandbox::protocol::GuestReadyEvent;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -119,11 +120,11 @@ pub fn build_vm_spec(
     memory_mib: u32,
     persistent: bool,
     vmm_kind: VmmKind,
-) -> VmInstanceSpec {
+) -> Result<VmInstanceSpec> {
     let work_dir = root.join("instances").join(sandbox_id);
-    let guest_image_path = std::env::var_os("RKFORGE_SANDBOX_GUEST_IMAGE").map(PathBuf::from);
     let kernel_path = std::env::var_os("RKFORGE_SANDBOX_KERNEL").map(PathBuf::from);
     let initrd_path = std::env::var_os("RKFORGE_SANDBOX_INITRD").map(PathBuf::from);
+    let guest_image_path = resolve_guest_image_path(root, image, vmm_kind)?;
     debug!(
         sandbox_id=%sandbox_id,
         root=%root.display(),
@@ -137,7 +138,7 @@ pub fn build_vm_spec(
         initrd=?initrd_path,
         "building vm instance spec"
     );
-    VmInstanceSpec {
+    Ok(VmInstanceSpec {
         sandbox_id: sandbox_id.to_string(),
         image: image.to_string(),
         cpus,
@@ -158,6 +159,24 @@ pub fn build_vm_spec(
         guest_cid: DEFAULT_GUEST_CID,
         agent_vsock_port: DEFAULT_AGENT_VSOCK_PORT,
         ready_vsock_port: DEFAULT_READY_VSOCK_PORT,
+    })
+}
+
+fn resolve_guest_image_path(
+    root: &Path,
+    image: &str,
+    vmm_kind: VmmKind,
+) -> Result<Option<PathBuf>> {
+    let explicit_guest_image = std::env::var_os("RKFORGE_SANDBOX_GUEST_IMAGE").map(PathBuf::from);
+    if explicit_guest_image.is_some() {
+        return Ok(explicit_guest_image);
+    }
+    match vmm_kind {
+        VmmKind::Firecracker => Ok(None),
+        VmmKind::Libkrun => {
+            let manager = GuestImageManager::new(root.to_path_buf())?;
+            manager.ensure_guest_image(image).map(Some)
+        }
     }
 }
 

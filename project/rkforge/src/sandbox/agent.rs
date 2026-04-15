@@ -41,6 +41,7 @@ fn run_vsock_agent(args: SandboxAgentArgs) -> Result<()> {
             ready_vsock_port,
         )?;
     }
+
     loop {
         let mut stream = listener.accept()?;
         debug!("accepted guest agent client connection");
