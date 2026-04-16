@@ -4,6 +4,8 @@ pub mod guest;
 mod guest_image;
 pub mod protocol;
 mod runtime_assets;
+pub mod sdk;
+pub mod types;
 pub mod vm;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -599,6 +601,11 @@ impl SandboxRuntime {
 }
 
 pub type SandboxManager = SandboxRuntime;
+
+#[allow(unused_imports)]
+pub use sdk::{SandboxClient, SandboxClientBuilder, SandboxHandle};
+#[allow(unused_imports)]
+pub use types::{SandboxCreateOptions, SandboxExecOptions, SandboxExecResult, SandboxMetadata};
 
 #[derive(Clone)]
 pub struct SandboxBox {

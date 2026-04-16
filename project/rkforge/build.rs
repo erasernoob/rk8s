@@ -3,6 +3,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const SANDBOX_FEATURE_ENV: &str = "CARGO_FEATURE_SANDBOX";
+const SANDBOX_PREBUILT_FEATURE_ENV: &str = "CARGO_FEATURE_SANDBOX_PREBUILT_RUNTIME";
+const SANDBOX_SOURCE_FEATURE_ENV: &str = "CARGO_FEATURE_SANDBOX_SOURCE_RUNTIME";
+const SANDBOX_SYSTEM_FEATURE_ENV: &str = "CARGO_FEATURE_SANDBOX_SYSTEM_RUNTIME";
 const DEPS_STUB_ENV: &str = "RKFORGE_SANDBOX_DEPS_STUB";
 const RUNTIME_LIB_DIR_ENV: &str = "RKFORGE_RUNTIME_LIB_DIR";
 const RUNTIME_TARBALL_ENV: &str = "RKFORGE_RUNTIME_TARBALL";
@@ -13,6 +17,21 @@ const GENERATED_FILE: &str = "sandbox_runtime_manifest.rs";
 const DEFAULT_PREBUILT_BASE_URL: &str = "https://download.rk8s.dev/rk8s/releases";
 
 fn main() {
+    println!("cargo:rerun-if-env-changed={SANDBOX_FEATURE_ENV}");
+    println!("cargo:rerun-if-env-changed={SANDBOX_PREBUILT_FEATURE_ENV}");
+    println!("cargo:rerun-if-env-changed={SANDBOX_SOURCE_FEATURE_ENV}");
+    println!("cargo:rerun-if-env-changed={SANDBOX_SYSTEM_FEATURE_ENV}");
+    if env::var_os(SANDBOX_FEATURE_ENV).is_none() {
+        let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR must be set"));
+        let generated = out_dir.join(GENERATED_FILE);
+        fs::write(
+            &generated,
+            "pub const EMBEDDED_RUNTIME_LIB_ASSETS: &[(&str, &[u8], u32)] = &[];\n",
+        )
+        .expect("failed to write empty embedded sandbox runtime manifest");
+        return;
+    }
+
     println!("cargo:rerun-if-env-changed={DEPS_STUB_ENV}");
     println!("cargo:rerun-if-env-changed={RUNTIME_LIB_DIR_ENV}");
     println!("cargo:rerun-if-env-changed={RUNTIME_TARBALL_ENV}");
@@ -21,14 +40,18 @@ fn main() {
     println!("cargo:rerun-if-env-changed={LIBKRUNFW_SRC_DIR_ENV}");
     println!("cargo:rerun-if-changed=runtime/current/lib");
     println!("cargo:rerun-if-changed=runtime/current.tar.gz");
+    println!("cargo:rerun-if-changed=.cargo_vcs_info.json");
     println!("cargo:rerun-if-changed=vendor/libkrun");
     println!("cargo:rerun-if-changed=vendor/libkrunfw");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR must be set"));
     let generated = out_dir.join(GENERATED_FILE);
-    let mode = DepsMode::from_env();
-    println!("cargo:warning=Sandbox runtime dependency mode: {:?}", mode);
-    let contents = generate_manifest(&out_dir, &mode);
+    let policy = RuntimeDepsPolicy::detect();
+    println!(
+        "cargo:warning=Sandbox runtime dependency mode: {:?} (strict={})",
+        policy.mode, policy.strict
+    );
+    let contents = generate_manifest(&out_dir, &policy);
     fs::write(&generated, contents).expect("failed to write embedded sandbox runtime manifest");
 }
 
@@ -40,21 +63,85 @@ enum DepsMode {
     System,
 }
 
-impl DepsMode {
-    fn from_env() -> Self {
+#[derive(Debug, Clone, Copy)]
+struct RuntimeDepsPolicy {
+    mode: DepsMode,
+    strict: bool,
+}
+
+impl RuntimeDepsPolicy {
+    fn detect() -> Self {
         match env::var(DEPS_STUB_ENV).ok().as_deref() {
-            Some("1") => Self::Stub,
-            Some("2") => Self::Prebuilt,
-            Some("3") => Self::System,
-            _ => {
-                if discover_runtime_source_dirs().is_some() {
-                    Self::Source
-                } else {
-                    Self::System
-                }
+            Some("1") => {
+                return Self {
+                    mode: DepsMode::Stub,
+                    strict: false,
+                };
             }
+            Some("2") => {
+                return Self {
+                    mode: DepsMode::Prebuilt,
+                    strict: true,
+                };
+            }
+            Some("3") => {
+                return Self {
+                    mode: DepsMode::System,
+                    strict: false,
+                };
+            }
+            Some(other) => {
+                panic!(
+                    "invalid {} value `{}`; expected 1 (stub), 2 (prebuilt), or 3 (system)",
+                    DEPS_STUB_ENV, other
+                );
+            }
+            None => {}
+        }
+
+        if env::var_os(SANDBOX_PREBUILT_FEATURE_ENV).is_some() {
+            return Self {
+                mode: DepsMode::Prebuilt,
+                strict: true,
+            };
+        }
+        if env::var_os(SANDBOX_SOURCE_FEATURE_ENV).is_some() {
+            return Self {
+                mode: DepsMode::Source,
+                strict: true,
+            };
+        }
+        if env::var_os(SANDBOX_SYSTEM_FEATURE_ENV).is_some() {
+            return Self {
+                mode: DepsMode::System,
+                strict: false,
+            };
+        }
+        if is_registry_package() {
+            return Self {
+                mode: DepsMode::Prebuilt,
+                strict: true,
+            };
+        }
+        if discover_runtime_source_dirs().is_some() {
+            return Self {
+                mode: DepsMode::Source,
+                strict: false,
+            };
+        }
+        Self {
+            mode: DepsMode::System,
+            strict: false,
         }
     }
+}
+
+fn is_registry_package() -> bool {
+    let manifest_dir = match env::var("CARGO_MANIFEST_DIR") {
+        Ok(value) => PathBuf::from(value),
+        Err(_) => return false,
+    };
+    manifest_dir.join(".cargo_vcs_info.json").exists()
 }
 
 fn discover_runtime_lib_dir() -> Option<PathBuf> {
@@ -69,7 +156,9 @@ fn discover_runtime_lib_dir() -> Option<PathBuf> {
     candidate.is_dir().then_some(candidate)
 }
 
-fn generate_manifest(out_dir: &Path, mode: &DepsMode) -> String {
+fn generate_manifest(out_dir: &Path, policy: &RuntimeDepsPolicy) -> String {
+    let mode = policy.mode;
+    let strict = policy.strict;
     let mut body =
         String::from("pub const EMBEDDED_RUNTIME_LIB_ASSETS: &[(&str, &[u8], u32)] = &[\n");
 
@@ -99,7 +188,7 @@ fn generate_manifest(out_dir: &Path, mode: &DepsMode) -> String {
                 absolute.display()
             ));
         }
-    } else if *mode == DepsMode::System
+    } else if mode == DepsMode::System
         && let Some(assets) = discover_system_runtime_assets()
     {
         for (relative, absolute) in assets {
@@ -115,14 +204,18 @@ fn generate_manifest(out_dir: &Path, mode: &DepsMode) -> String {
                 println!("cargo:warning=Sandbox runtime embedding disabled in stub mode");
             }
             DepsMode::Prebuilt => {
-                println!(
-                    "cargo:warning=Prebuilt sandbox runtime requested, but no runtime/current/lib (or RKFORGE_RUNTIME_LIB_DIR) was found"
-                );
+                let message = "prebuilt sandbox runtime was required, but no runtime bundle or tarball could be resolved";
+                if strict {
+                    panic!("{message}");
+                }
+                println!("cargo:warning={message}");
             }
             DepsMode::Source => {
-                println!(
-                    "cargo:warning=Source sandbox runtime requested, but no vendored runtime sources were successfully prepared"
-                );
+                let message = "source sandbox runtime was selected, but vendored runtime sources were not successfully prepared";
+                if strict {
+                    panic!("{message}");
+                }
+                println!("cargo:warning={message}");
             }
             DepsMode::System => {
                 println!(

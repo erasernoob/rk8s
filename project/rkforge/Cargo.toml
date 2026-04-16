@@ -6,6 +6,13 @@ authors = ["rk8s-dev team"]
 description = "Image builder for rk8s"
 repository = "https://github.com/r2cn-dev/rk8s/tree/main/project/rkforge"
 
+[features]
+default = ["sandbox", "sandbox-system-runtime"]
+sandbox = []
+sandbox-prebuilt-runtime = ["sandbox"]
+sandbox-source-runtime = ["sandbox"]
+sandbox-system-runtime = ["sandbox"]
+
 [dependencies]
 common = { workspace = true }
 libnetwork = { workspace = true }

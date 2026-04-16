@@ -1,14 +1,12 @@
 # Sandbox Guest Image
 
-`libkrun` now expects the guest image to contain `rkforge` in two locations:
+`libkrun` now expects the guest image to contain `rkforge` at:
 
 - `/usr/local/bin/rkforge`
-- `/sbin/init`
 
-When the VM boots, the kernel starts `/sbin/init`. Because that file is the
-`rkforge` binary, `rkforge` detects that it is running as PID 1 inside the
-guest and switches into guest-init mode. Guest-init mounts the minimum guest
-filesystems and then `exec`s:
+When the VM boots on the current libkrun path, libkrun's built-in init is used
+to switch to the configured root filesystem and then `krun_set_exec(...)`
+launches:
 
 ```text
 rkforge sandbox-agent --vsock-port 26950
@@ -47,3 +45,5 @@ Optional:
 
 - Set `RKFORGE_SANDBOX_AGENT_VSOCK_PORT` in the guest environment if you need a
   non-default port. The default is `26950`.
+- Set `RKFORGE_SANDBOX_READY_VSOCK_PORT` if the guest ready channel must use a
+  non-default port. The default is `26951`.

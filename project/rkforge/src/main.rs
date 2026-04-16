@@ -21,6 +21,7 @@ mod registry;
 mod repo;
 mod rt;
 mod run;
+#[cfg(feature = "sandbox")]
 mod sandbox;
 mod storage;
 mod task;
@@ -37,6 +38,7 @@ fn main() -> Result<()> {
         .with(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    #[cfg(feature = "sandbox")]
     if sandbox::guest::should_run_as_init() {
         return sandbox::guest::run_as_init();
     }
@@ -99,11 +101,13 @@ fn main() -> Result<()> {
         }
         Commands::Save(args) => images::save_image(args),
 
-        // Sandbox related command
+        #[cfg(feature = "sandbox")]
         Commands::Sandbox(cmd) => sandbox::cli::execute(cmd),
-        // TODO: Consider **Decouple** the shim,guestInit with rkforge main binary in the future
+        #[cfg(feature = "sandbox")]
         Commands::SandboxShim(args) => sandbox::vm::run_shim_command(args),
+        #[cfg(feature = "sandbox")]
         Commands::SandboxAgent(args) => sandbox::agent::run_command(args),
+        #[cfg(feature = "sandbox")]
         Commands::SandboxGuestInit(args) => sandbox::guest::run_command(args),
 
         Commands::Start(args) => container::start_container(&args.container_name),
