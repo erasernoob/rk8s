@@ -13,13 +13,19 @@ const LIBKRUN_LIBRARY_OVERRIDE_ENV: &str = "RKFORGE_LIBKRUN_LIBRARY";
 const LIBKRUN_DIR_OVERRIDE_ENV: &str = "RKFORGE_LIBKRUN_DIR";
 const LIBKRUNFW_LIBRARY_OVERRIDE_ENV: &str = "RKFORGE_LIBKRUNFW_PATH";
 const LIBKRUNFW_DIR_OVERRIDE_ENV: &str = "RKFORGE_LIBKRUNFW_DIR";
-const RUNTIME_BIN_NAME: &str = "rkforge";
+pub const RUNTIME_BIN_NAME: &str = "rkforge";
+pub const SHIM_HELPER_BIN_NAME: &str = "rkforge-sandbox-shim";
+pub const AGENT_HELPER_BIN_NAME: &str = "rkforge-sandbox-agent";
+pub const GUEST_INIT_HELPER_BIN_NAME: &str = "rkforge-sandbox-guest-init";
 const REPO_RUNTIME_DIR_NAME: &str = "runtime";
 const REPO_RUNTIME_CURRENT_DIR_NAME: &str = "current";
 
 #[derive(Debug, Clone)]
 pub struct RuntimeAssetBundle {
     rkforge_binary: PathBuf,
+    shim_binary: PathBuf,
+    agent_binary: PathBuf,
+    guest_init_binary: PathBuf,
     libkrun_library: Option<PathBuf>,
     libkrunfw_path: Option<PathBuf>,
 }
@@ -40,38 +46,72 @@ impl RuntimeAssetBundle {
         fs::create_dir_all(&lib_dir)
             .with_context(|| format!("failed to create {}", lib_dir.display()))?;
 
-        let host_binary = std::env::var_os(HOST_BINARY_OVERRIDE_ENV)
-            .map(PathBuf::from)
-            .unwrap_or(std::env::current_exe().context("failed to resolve current executable")?);
-        if !host_binary.is_file() {
-            bail!(
-                "sandbox host binary does not exist: {}",
-                host_binary.display()
-            );
-        }
-        let rkforge_binary = bin_dir.join(RUNTIME_BIN_NAME);
-        stage_executable(&host_binary, &rkforge_binary)?;
-
-        let (libkrun_library, libkrunfw_path) = if extract_embedded_runtime_libs(&lib_dir)? {
-            (
-                find_library_in_dir(&lib_dir, &["libkrun.so"]),
-                find_library_in_dir(&lib_dir, &["libkrunfw.so"]),
-            )
+        let (
+            rkforge_binary,
+            shim_binary,
+            agent_binary,
+            guest_init_binary,
+            libkrun_library,
+            libkrunfw_path,
+        ) = if extract_embedded_runtime_assets(&runtime_root)? {
+            if !runtime_root.join("bin").join(RUNTIME_BIN_NAME).is_file() {
+                let host_binary = std::env::var_os(HOST_BINARY_OVERRIDE_ENV)
+                    .map(PathBuf::from)
+                    .unwrap_or(
+                        std::env::current_exe().context("failed to resolve current executable")?,
+                    );
+                let rkforge_binary = bin_dir.join(RUNTIME_BIN_NAME);
+                stage_executable(&host_binary, &rkforge_binary)?;
+                stage_helper_aliases(&bin_dir, RUNTIME_BIN_NAME)?;
+            }
+            resolve_bundle_layout(&runtime_root)?
         } else {
-            let source_libkrun = discover_libkrun_library();
-            let libkrun_library = source_libkrun
-                .as_deref()
-                .map(|path| stage_shared_library(path, &lib_dir, "libkrun.so"))
-                .transpose()?;
-            let libkrunfw_path = discover_libkrunfw_path(source_libkrun.as_deref())
-                .as_deref()
-                .map(|path| stage_shared_library(path, &lib_dir, "libkrunfw.so"))
-                .transpose()?;
-            (libkrun_library, libkrunfw_path)
+            let host_binary = std::env::var_os(HOST_BINARY_OVERRIDE_ENV)
+                .map(PathBuf::from)
+                .unwrap_or(
+                    std::env::current_exe().context("failed to resolve current executable")?,
+                );
+            if !host_binary.is_file() {
+                bail!(
+                    "sandbox host binary does not exist: {}",
+                    host_binary.display()
+                );
+            }
+            let rkforge_binary = bin_dir.join(RUNTIME_BIN_NAME);
+            stage_executable(&host_binary, &rkforge_binary)?;
+            stage_helper_aliases(&bin_dir, RUNTIME_BIN_NAME)?;
+
+            let (libkrun_library, libkrunfw_path) = (
+                if let Some(path) = discover_libkrun_library().as_deref() {
+                    Some(stage_shared_library(path, &lib_dir, "libkrun.so")?)
+                } else {
+                    None
+                },
+                if let Some(path) =
+                    discover_libkrunfw_path(discover_libkrun_library().as_deref()).as_deref()
+                {
+                    Some(stage_shared_library(path, &lib_dir, "libkrunfw.so")?)
+                } else {
+                    None
+                },
+            );
+            let (rkforge_binary, shim_binary, agent_binary, guest_init_binary, _, _) =
+                resolve_bundle_layout(&runtime_root)?;
+            (
+                rkforge_binary,
+                shim_binary,
+                agent_binary,
+                guest_init_binary,
+                libkrun_library,
+                libkrunfw_path,
+            )
         };
 
         Ok(Self {
             rkforge_binary,
+            shim_binary,
+            agent_binary,
+            guest_init_binary,
             libkrun_library,
             libkrunfw_path,
         })
@@ -91,6 +131,18 @@ impl RuntimeAssetBundle {
         &self.rkforge_binary
     }
 
+    pub fn shim_binary(&self) -> &Path {
+        &self.shim_binary
+    }
+
+    pub fn agent_binary(&self) -> &Path {
+        &self.agent_binary
+    }
+
+    pub fn guest_init_binary(&self) -> &Path {
+        &self.guest_init_binary
+    }
+
     pub fn libkrun_library(&self) -> Option<&Path> {
         self.libkrun_library.as_deref()
     }
@@ -100,19 +152,21 @@ impl RuntimeAssetBundle {
     }
 
     fn open_existing(root: PathBuf) -> Result<Self> {
-        let bin_dir = root.join("bin");
-        let lib_dir = root.join("lib");
-        let rkforge_binary = bin_dir.join(RUNTIME_BIN_NAME);
-        if !rkforge_binary.is_file() {
-            bail!(
-                "sandbox runtime bundle is missing binary {}",
-                rkforge_binary.display()
-            );
-        }
+        let (
+            rkforge_binary,
+            shim_binary,
+            agent_binary,
+            guest_init_binary,
+            libkrun_library,
+            libkrunfw_path,
+        ) = resolve_bundle_layout(&root)?;
         Ok(Self {
             rkforge_binary,
-            libkrun_library: find_library_in_dir(&lib_dir, &["libkrun.so"]),
-            libkrunfw_path: find_library_in_dir(&lib_dir, &["libkrunfw.so"]),
+            shim_binary,
+            agent_binary,
+            guest_init_binary,
+            libkrun_library,
+            libkrunfw_path,
         })
     }
 }
@@ -202,6 +256,49 @@ fn is_runtime_bundle_root(path: &Path) -> bool {
     path.join("bin").join(RUNTIME_BIN_NAME).is_file() && path.join("lib").is_dir()
 }
 
+fn resolve_bundle_layout(
+    root: &Path,
+) -> Result<(
+    PathBuf,
+    PathBuf,
+    PathBuf,
+    PathBuf,
+    Option<PathBuf>,
+    Option<PathBuf>,
+)> {
+    let bin_dir = root.join("bin");
+    let lib_dir = root.join("lib");
+    let rkforge_binary = bin_dir.join(RUNTIME_BIN_NAME);
+    if !rkforge_binary.is_file() {
+        bail!(
+            "sandbox runtime bundle is missing binary {}",
+            rkforge_binary.display()
+        );
+    }
+    let shim_binary = helper_or_main(&bin_dir, SHIM_HELPER_BIN_NAME, &rkforge_binary);
+    let agent_binary = helper_or_main(&bin_dir, AGENT_HELPER_BIN_NAME, &rkforge_binary);
+    let guest_init_binary = helper_or_main(&bin_dir, GUEST_INIT_HELPER_BIN_NAME, &rkforge_binary);
+    let libkrun_library = find_library_in_dir(&lib_dir, &["libkrun.so"]);
+    let libkrunfw_path = find_library_in_dir(&lib_dir, &["libkrunfw.so"]);
+    Ok((
+        rkforge_binary,
+        shim_binary,
+        agent_binary,
+        guest_init_binary,
+        libkrun_library,
+        libkrunfw_path,
+    ))
+}
+
+fn helper_or_main(bin_dir: &Path, helper_name: &str, main_binary: &Path) -> PathBuf {
+    let helper = bin_dir.join(helper_name);
+    if helper.is_file() {
+        helper
+    } else {
+        main_binary.to_path_buf()
+    }
+}
+
 fn stage_runtime_bundle(source_root: &Path, dest_root: &Path) -> Result<()> {
     let source_bin = source_root.join("bin");
     let source_lib = source_root.join("lib");
@@ -217,19 +314,22 @@ fn stage_runtime_bundle(source_root: &Path, dest_root: &Path) -> Result<()> {
         &dest_bin.join(RUNTIME_BIN_NAME),
     )?;
     stage_directory_contents(&source_lib, &dest_lib)?;
+    if source_bin.is_dir() {
+        stage_directory_contents(&source_bin, &dest_bin)?;
+    }
+    stage_helper_aliases(&dest_bin, RUNTIME_BIN_NAME)?;
     Ok(())
 }
 
-fn extract_embedded_runtime_libs(dest_lib_dir: &Path) -> Result<bool> {
-    if embedded_runtime_manifest::EMBEDDED_RUNTIME_LIB_ASSETS.is_empty() {
+fn extract_embedded_runtime_assets(runtime_root: &Path) -> Result<bool> {
+    if embedded_runtime_manifest::EMBEDDED_RUNTIME_ASSETS.is_empty() {
         return Ok(false);
     }
-    fs::create_dir_all(dest_lib_dir)
-        .with_context(|| format!("failed to create {}", dest_lib_dir.display()))?;
-    for (relative_path, bytes, mode) in embedded_runtime_manifest::EMBEDDED_RUNTIME_LIB_ASSETS {
+    fs::create_dir_all(runtime_root)
+        .with_context(|| format!("failed to create {}", runtime_root.display()))?;
+    for (relative_path, bytes, mode) in embedded_runtime_manifest::EMBEDDED_RUNTIME_ASSETS {
         let relative = Path::new(relative_path);
-        let relative = relative.strip_prefix("lib").unwrap_or(relative);
-        let dest = dest_lib_dir.join(relative);
+        let dest = runtime_root.join(relative);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -247,7 +347,32 @@ fn extract_embedded_runtime_libs(dest_lib_dir: &Path) -> Result<bool> {
         fs::set_permissions(&dest, perms)
             .with_context(|| format!("failed to chmod {}", dest.display()))?;
     }
+    let bin_dir = runtime_root.join("bin");
+    if bin_dir.is_dir() {
+        stage_helper_aliases(&bin_dir, RUNTIME_BIN_NAME)?;
+    }
     Ok(true)
+}
+
+fn stage_helper_aliases(bin_dir: &Path, main_name: &str) -> Result<()> {
+    for helper in [
+        SHIM_HELPER_BIN_NAME,
+        AGENT_HELPER_BIN_NAME,
+        GUEST_INIT_HELPER_BIN_NAME,
+    ] {
+        let alias_path = bin_dir.join(helper);
+        let target_path = bin_dir.join(main_name);
+        if alias_path == target_path {
+            continue;
+        }
+        if alias_path.is_file() {
+            continue;
+        }
+        replace_symlink_or_file(&alias_path)?;
+        symlink(main_name, &alias_path)
+            .with_context(|| format!("failed to create helper alias {}", alias_path.display()))?;
+    }
+    Ok(())
 }
 
 fn stage_directory_contents(source_dir: &Path, dest_dir: &Path) -> Result<()> {

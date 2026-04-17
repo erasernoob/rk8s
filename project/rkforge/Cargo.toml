@@ -13,6 +13,21 @@ sandbox-prebuilt-runtime = ["sandbox"]
 sandbox-source-runtime = ["sandbox"]
 sandbox-system-runtime = ["sandbox"]
 
+[[bin]]
+name = "rkforge-sandbox-shim"
+path = "src/sandbox/bin/shim_main.rs"
+required-features = ["sandbox"]
+
+[[bin]]
+name = "rkforge-sandbox-agent"
+path = "src/sandbox/bin/agent_main.rs"
+required-features = ["sandbox"]
+
+[[bin]]
+name = "rkforge-sandbox-guest-init"
+path = "src/sandbox/bin/guest_init_main.rs"
+required-features = ["sandbox"]
+
 [dependencies]
 common = { workspace = true }
 libnetwork = { workspace = true }

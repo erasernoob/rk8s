@@ -2,7 +2,7 @@ use crate::sandbox::guest_image::GuestImageManager;
 use crate::sandbox::protocol::GuestReadyEvent;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use clap::Args;
+use clap::{Args, Parser};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::fs::OpenOptions;
@@ -98,6 +98,12 @@ impl VmmKind {
 pub struct SandboxShimArgs {
     #[arg(long)]
     pub spec: PathBuf,
+}
+
+#[derive(Parser)]
+struct SandboxShimBinaryCli {
+    #[command(flatten)]
+    args: SandboxShimArgs,
 }
 
 const DEFAULT_GUEST_CID: u32 = 3;
@@ -200,6 +206,10 @@ pub fn run_shim_command(args: SandboxShimArgs) -> Result<()> {
     result
 }
 
+pub fn run_shim_binary() -> Result<()> {
+    run_shim_command(SandboxShimBinaryCli::parse().args)
+}
+
 pub fn shim_log_path(work_dir: &Path) -> PathBuf {
     work_dir.join(SHIM_LOG_FILE)
 }
@@ -277,7 +287,6 @@ pub fn spawn_shim_process(shim_binary: &Path, spec_path: &Path, work_dir: &Path)
     );
 
     let mut child = Command::new(shim_binary)
-        .arg("sandbox-shim")
         .arg("--spec")
         .arg(spec_path)
         .stdin(Stdio::null())

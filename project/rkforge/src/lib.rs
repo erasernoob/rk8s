@@ -25,5 +25,5 @@ pub use image::build_runtime;
 #[cfg(feature = "sandbox")]
 pub use sandbox::{
     SandboxClient, SandboxClientBuilder, SandboxCreateOptions, SandboxExecOptions,
-    SandboxExecResult, SandboxHandle, SandboxMetadata,
+    SandboxExecResult, SandboxExecSpec, SandboxExecTarget, SandboxHandle, SandboxMetadata,
 };

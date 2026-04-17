@@ -21,11 +21,15 @@ const GUEST_IMAGE_FILENAME: &str = "guest-rootfs.ext4";
 const GUEST_IMAGE_METADATA_FILE: &str = "guest-image.json";
 const GUEST_IMAGE_SIZE_PADDING_MIB: u64 = 256;
 const GUEST_RKFORGE_PATH: &str = "usr/local/bin/rkforge";
+const GUEST_AGENT_ALIAS_PATH: &str = "usr/local/bin/rkforge-sandbox-agent";
+const GUEST_INIT_ALIAS_PATH: &str = "usr/local/bin/rkforge-sandbox-guest-init";
 
 #[derive(Debug, Clone)]
 pub struct GuestImageManager {
     root: PathBuf,
     guest_binary: PathBuf,
+    agent_binary: PathBuf,
+    guest_init_binary: PathBuf,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -41,13 +45,20 @@ impl GuestImageManager {
     pub fn new(root: PathBuf) -> Result<Self> {
         let assets = RuntimeAssetBundle::prepare(&root)?;
         let guest_binary = assets.rkforge_binary().to_path_buf();
+        let agent_binary = assets.agent_binary().to_path_buf();
+        let guest_init_binary = assets.guest_init_binary().to_path_buf();
         if !guest_binary.is_file() {
             bail!(
                 "sandbox guest binary does not exist: {}",
                 guest_binary.display()
             );
         }
-        Ok(Self { root, guest_binary })
+        Ok(Self {
+            root,
+            guest_binary,
+            agent_binary,
+            guest_init_binary,
+        })
     }
 
     pub fn ensure_guest_image(&self, image_ref: &str) -> Result<PathBuf> {
@@ -125,7 +136,12 @@ impl GuestImageManager {
         rt::block_on(bundle::mount_and_copy_bundle(&bundle_dir, &layers))??;
 
         let rootfs_dir = bundle_dir.join("rootfs");
-        prepare_guest_rootfs(&rootfs_dir, &self.guest_binary)?;
+        prepare_guest_rootfs(
+            &rootfs_dir,
+            &self.guest_binary,
+            &self.agent_binary,
+            &self.guest_init_binary,
+        )?;
 
         let built_image = build_dir.path().join(GUEST_IMAGE_FILENAME);
         build_ext4_image(&rootfs_dir, &built_image)?;
@@ -186,7 +202,12 @@ fn ensure_tool(binary: &str) -> Result<()> {
     bail!("`{binary}` is required to build sandbox guest images automatically")
 }
 
-fn prepare_guest_rootfs(rootfs_dir: &Path, guest_binary: &Path) -> Result<()> {
+fn prepare_guest_rootfs(
+    rootfs_dir: &Path,
+    guest_binary: &Path,
+    agent_binary: &Path,
+    guest_init_binary: &Path,
+) -> Result<()> {
     fs::create_dir_all(rootfs_dir.join("usr/local/bin")).with_context(|| {
         format!(
             "failed to create {}",
@@ -215,6 +236,13 @@ fn prepare_guest_rootfs(rootfs_dir: &Path, guest_binary: &Path) -> Result<()> {
             installed_guest_binary.display()
         )
     })?;
+    stage_guest_helper(rootfs_dir, GUEST_AGENT_ALIAS_PATH, agent_binary, "rkforge")?;
+    stage_guest_helper(
+        rootfs_dir,
+        GUEST_INIT_ALIAS_PATH,
+        guest_init_binary,
+        "rkforge",
+    )?;
 
     if !rootfs_dir.join("usr/local/bin/python3").is_file()
         && !rootfs_dir.join("usr/bin/python3").is_file()
@@ -226,6 +254,54 @@ fn prepare_guest_rootfs(rootfs_dir: &Path, guest_binary: &Path) -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+fn stage_guest_helper(
+    rootfs_dir: &Path,
+    relative_path: &str,
+    source_binary: &Path,
+    fallback_target_name: &str,
+) -> Result<()> {
+    let alias_path = rootfs_dir.join(relative_path);
+    if let Some(parent) = alias_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    if alias_path.exists() || fs::symlink_metadata(&alias_path).is_ok() {
+        fs::remove_file(&alias_path)
+            .with_context(|| format!("failed to remove {}", alias_path.display()))?;
+    }
+    let main_canonical =
+        fs::canonicalize(rootfs_dir.join(GUEST_RKFORGE_PATH)).with_context(|| {
+            format!(
+                "failed to resolve {}",
+                rootfs_dir.join(GUEST_RKFORGE_PATH).display()
+            )
+        })?;
+    let helper_canonical =
+        fs::canonicalize(source_binary).unwrap_or_else(|_| source_binary.to_path_buf());
+    if helper_canonical == main_canonical {
+        std::os::unix::fs::symlink(fallback_target_name, &alias_path).with_context(|| {
+            format!(
+                "failed to create guest helper alias {}",
+                alias_path.display()
+            )
+        })?;
+    } else {
+        fs::copy(source_binary, &alias_path).with_context(|| {
+            format!(
+                "failed to inject guest helper binary into {}",
+                alias_path.display()
+            )
+        })?;
+        let mut perms = fs::metadata(&alias_path)
+            .with_context(|| format!("failed to stat {}", alias_path.display()))?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&alias_path, perms)
+            .with_context(|| format!("failed to chmod {}", alias_path.display()))?;
+    }
     Ok(())
 }
 

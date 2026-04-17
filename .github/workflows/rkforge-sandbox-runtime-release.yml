@@ -52,10 +52,14 @@ jobs:
           path: project/target
           key: ${{ runner.os }}-cargo-build-target-${{ matrix.target.rust }}-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build rkforge release binary
+      - name: Build rkforge release binaries
         working-directory: ./project
         run: |
-          cargo build --release --target ${{ matrix.target.rust }} -p rkforge
+          cargo build --release --target ${{ matrix.target.rust }} -p rkforge \
+            --bin rkforge \
+            --bin rkforge-sandbox-shim \
+            --bin rkforge-sandbox-agent \
+            --bin rkforge-sandbox-guest-init
 
       - name: Build libkrunfw from source
         run: |
@@ -85,6 +89,10 @@ jobs:
             --libkrunfw /tmp/rkforge-runtime-install/libkrunfw/lib64/libkrunfw.so \
             --output runtime/current \
             --archive "dist/rkforge-sandbox-runtime-${VERSION}-${TARGET}.tar.gz"
+
+          test -f "${GITHUB_WORKSPACE}/project/target/${{ matrix.target.rust }}/release/rkforge-sandbox-shim"
+          test -f "${GITHUB_WORKSPACE}/project/target/${{ matrix.target.rust }}/release/rkforge-sandbox-agent"
+          test -f "${GITHUB_WORKSPACE}/project/target/${{ matrix.target.rust }}/release/rkforge-sandbox-guest-init"
 
       - name: Upload runtime artifact to Cloudflare R2
         env:

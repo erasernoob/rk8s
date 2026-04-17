@@ -605,7 +605,10 @@ pub type SandboxManager = SandboxRuntime;
 #[allow(unused_imports)]
 pub use sdk::{SandboxClient, SandboxClientBuilder, SandboxHandle};
 #[allow(unused_imports)]
-pub use types::{SandboxCreateOptions, SandboxExecOptions, SandboxExecResult, SandboxMetadata};
+pub use types::{
+    SandboxCreateOptions, SandboxExecOptions, SandboxExecResult, SandboxExecSpec,
+    SandboxExecTarget, SandboxMetadata,
+};
 
 #[derive(Clone)]
 pub struct SandboxBox {

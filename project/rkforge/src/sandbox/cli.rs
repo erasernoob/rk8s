@@ -1,6 +1,6 @@
 use crate::rt;
 use crate::sandbox::sdk::SandboxClient;
-use crate::sandbox::types::{SandboxCreateOptions, SandboxExecOptions, SandboxExecResult};
+use crate::sandbox::types::{SandboxCreateOptions, SandboxExecResult, SandboxExecSpec};
 use anyhow::{Result, anyhow};
 use clap::{Args, Subcommand};
 
@@ -94,18 +94,14 @@ pub fn execute(cmd: SandboxCommand) -> Result<()> {
                 // Here we provide a quick start interface `--code` to let user run a python command directly
                 if let Some(code) = args.code {
                     sandbox
-                        .exec_python(
-                            code,
-                            SandboxExecOptions::new().timeout_secs(args.timeout_secs),
-                        )
+                        .execute(SandboxExecSpec::python(code).timeout_secs(args.timeout_secs))
                         .await
                 } else {
                     let (command, cmd_args) = split_command(args.command)?;
                     sandbox
-                        .exec(
-                            command,
-                            cmd_args,
-                            SandboxExecOptions::new().timeout_secs(args.timeout_secs),
+                        .execute(
+                            SandboxExecSpec::command(command, cmd_args)
+                                .timeout_secs(args.timeout_secs),
                         )
                         .await
                 }

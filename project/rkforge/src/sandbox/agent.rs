@@ -2,7 +2,7 @@ use crate::sandbox::protocol::{GuestExecRequest, GuestExecResponse, GuestReadyEv
 use crate::sandbox::{read_message, write_message};
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use clap::Args;
+use clap::{Args, Parser};
 use std::io::{Read, Write};
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -24,6 +24,16 @@ pub struct SandboxAgentArgs {
 
 pub fn run_command(args: SandboxAgentArgs) -> Result<()> {
     run_vsock_agent(args)
+}
+
+#[derive(Parser)]
+struct SandboxAgentBinaryCli {
+    #[command(flatten)]
+    args: SandboxAgentArgs,
+}
+
+pub fn run_binary() -> Result<()> {
+    run_command(SandboxAgentBinaryCli::parse().args)
 }
 
 fn run_vsock_agent(args: SandboxAgentArgs) -> Result<()> {

@@ -9,6 +9,9 @@ Usage:
 
 Build a sandbox runtime bundle directory containing:
   - bin/rkforge
+  - bin/rkforge-sandbox-shim
+  - bin/rkforge-sandbox-agent
+  - bin/rkforge-sandbox-guest-init
   - lib/libkrun.so*
   - lib/libkrunfw.so*
 
@@ -17,6 +20,13 @@ Default output:
 
 The produced directory is intended to be discovered automatically by rkforge's
 sandbox runtime code during local development, similar to BoxLite's script layer.
+
+When `--archive` is used, real helper binaries must be present in the same target
+directory as `rkforge`:
+
+  - rkforge-sandbox-shim
+  - rkforge-sandbox-agent
+  - rkforge-sandbox-guest-init
 EOF
 }
 
@@ -84,6 +94,10 @@ LIBKRUN_PATH="${LIBKRUN_PATH:-${RKFORGE_LIBKRUN_LIBRARY:-/usr/local/lib64/libkru
 LIBKRUNFW_PATH="${LIBKRUNFW_PATH:-${RKFORGE_LIBKRUNFW_PATH:-/usr/local/lib64/libkrunfw.so}}"
 LIBKRUN_SRC="${LIBKRUN_SRC:-${RKFORGE_LIBKRUN_SRC_DIR:-${REPO_ROOT}/vendor/libkrun}}"
 LIBKRUNFW_SRC="${LIBKRUNFW_SRC:-${RKFORGE_LIBKRUNFW_SRC_DIR:-${REPO_ROOT}/vendor/libkrunfw}}"
+RKFORGE_BIN_DIR="$(cd -- "$(dirname -- "${RKFORGE_BIN}")" && pwd)"
+SHIM_BIN_CANDIDATE="${RKFORGE_BIN_DIR}/rkforge-sandbox-shim"
+AGENT_BIN_CANDIDATE="${RKFORGE_BIN_DIR}/rkforge-sandbox-agent"
+GUEST_INIT_BIN_CANDIDATE="${RKFORGE_BIN_DIR}/rkforge-sandbox-guest-init"
 
 die() {
   echo "error: $*" >&2
@@ -156,6 +170,28 @@ need_file "${LIBKRUNFW_PATH}"
 
 mkdir -p "${OUTPUT_DIR}/bin" "${OUTPUT_DIR}/lib"
 install -m 0755 "${RKFORGE_BIN}" "${OUTPUT_DIR}/bin/rkforge"
+
+if [[ -f "${SHIM_BIN_CANDIDATE}" ]]; then
+  install -m 0755 "${SHIM_BIN_CANDIDATE}" "${OUTPUT_DIR}/bin/rkforge-sandbox-shim"
+else
+  [[ -z "${ARCHIVE_PATH}" ]] || die "prebuilt runtime archive requires real helper binary: ${SHIM_BIN_CANDIDATE}"
+  ln -sfn rkforge "${OUTPUT_DIR}/bin/rkforge-sandbox-shim"
+fi
+
+if [[ -f "${AGENT_BIN_CANDIDATE}" ]]; then
+  install -m 0755 "${AGENT_BIN_CANDIDATE}" "${OUTPUT_DIR}/bin/rkforge-sandbox-agent"
+else
+  [[ -z "${ARCHIVE_PATH}" ]] || die "prebuilt runtime archive requires real helper binary: ${AGENT_BIN_CANDIDATE}"
+  ln -sfn rkforge "${OUTPUT_DIR}/bin/rkforge-sandbox-agent"
+fi
+
+if [[ -f "${GUEST_INIT_BIN_CANDIDATE}" ]]; then
+  install -m 0755 "${GUEST_INIT_BIN_CANDIDATE}" "${OUTPUT_DIR}/bin/rkforge-sandbox-guest-init"
+else
+  [[ -z "${ARCHIVE_PATH}" ]] || die "prebuilt runtime archive requires real helper binary: ${GUEST_INIT_BIN_CANDIDATE}"
+  ln -sfn rkforge "${OUTPUT_DIR}/bin/rkforge-sandbox-guest-init"
+fi
+
 stage_shared_library "${LIBKRUN_PATH}" "${OUTPUT_DIR}/lib" "libkrun.so"
 stage_shared_library "${LIBKRUNFW_PATH}" "${OUTPUT_DIR}/lib" "libkrunfw.so"
 

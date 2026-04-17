@@ -27,7 +27,7 @@ use uuid::Uuid;
 const DEFAULT_BOOT_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const KRUN_KERNEL_FORMAT_RAW: u32 = 0;
-const GUEST_RKFORGE_PATH: &str = "/usr/local/bin/rkforge";
+const GUEST_AGENT_BINARY_PATH: &str = "/usr/local/bin/rkforge-sandbox-agent";
 
 type KrunCreateCtxFn = unsafe extern "C" fn() -> c_int;
 type KrunSetVmConfigFn = unsafe extern "C" fn(u32, u8, u32) -> c_int;
@@ -52,7 +52,7 @@ pub struct LibkrunVmBackend {
 impl LibkrunVmBackend {
     pub fn new(root: PathBuf) -> Result<Self> {
         let assets = RuntimeAssetBundle::prepare(&root)?;
-        let shim_binary = assets.rkforge_binary().to_path_buf();
+        let shim_binary = assets.shim_binary().to_path_buf();
         Ok(Self {
             root,
             shim_binary,
@@ -438,11 +438,8 @@ unsafe fn configure_guest_entrypoint(
         )?
     };
 
-    // Set guest's exec_path using GUEST_RKFORGE_PATH
-    // Note: libkrun now only support use `krun_set_exec` to set init process
-    let exec_path = CString::new(GUEST_RKFORGE_PATH).unwrap();
+    let exec_path = CString::new(GUEST_AGENT_BINARY_PATH).unwrap();
     let argv_storage = [
-        CString::new("sandbox-agent").unwrap(),
         CString::new("--vsock-port").unwrap(),
         CString::new(spec.agent_vsock_port.to_string()).unwrap(),
         CString::new("--ready-vsock-port").unwrap(),
@@ -468,7 +465,7 @@ unsafe fn configure_guest_entrypoint(
     debug!(
         sandbox_id=%spec.sandbox_id,
         ctx,
-        exec_path=GUEST_RKFORGE_PATH,
+        exec_path=GUEST_AGENT_BINARY_PATH,
         workdir="/",
         agent_vsock_port=spec.agent_vsock_port,
         ready_vsock_port=spec.ready_vsock_port,

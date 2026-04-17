@@ -26,7 +26,7 @@ fn main() {
         let generated = out_dir.join(GENERATED_FILE);
         fs::write(
             &generated,
-            "pub const EMBEDDED_RUNTIME_LIB_ASSETS: &[(&str, &[u8], u32)] = &[];\n",
+            "pub const EMBEDDED_RUNTIME_ASSETS: &[(&str, &[u8], u32)] = &[];\n",
         )
         .expect("failed to write empty embedded sandbox runtime manifest");
         return;
@@ -156,11 +156,29 @@ fn discover_runtime_lib_dir() -> Option<PathBuf> {
     candidate.is_dir().then_some(candidate)
 }
 
+fn discover_runtime_root() -> Option<PathBuf> {
+    if let Some(path) = env::var_os(RUNTIME_LIB_DIR_ENV).map(PathBuf::from)
+        && path.is_dir()
+        && let Some(root) = path.parent()
+        && root.join("bin").is_dir()
+    {
+        return Some(root.to_path_buf());
+    }
+
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").ok()?);
+    let candidate = manifest_dir.join("runtime/current");
+    candidate.join("bin").is_dir().then_some(candidate)
+}
+
 fn generate_manifest(out_dir: &Path, policy: &RuntimeDepsPolicy) -> String {
     let mode = policy.mode;
     let strict = policy.strict;
-    let mut body =
-        String::from("pub const EMBEDDED_RUNTIME_LIB_ASSETS: &[(&str, &[u8], u32)] = &[\n");
+    let mut body = String::from("pub const EMBEDDED_RUNTIME_ASSETS: &[(&str, &[u8], u32)] = &[\n");
+
+    let runtime_root = match mode {
+        DepsMode::Prebuilt => prepare_prebuilt_runtime_root(out_dir).or_else(discover_runtime_root),
+        _ => discover_runtime_root(),
+    };
 
     let runtime_lib_dir = match mode {
         DepsMode::Stub => None,
@@ -173,7 +191,27 @@ fn generate_manifest(out_dir: &Path, policy: &RuntimeDepsPolicy) -> String {
         DepsMode::System => discover_runtime_lib_dir(),
     };
 
-    if let Some(dir) = runtime_lib_dir.as_deref()
+    if let Some(root) = runtime_root.as_deref()
+        && let Ok(entries) = collect_runtime_bundle_files(root)
+    {
+        if mode == DepsMode::Prebuilt
+            && let Err(err) = validate_prebuilt_runtime_root(root)
+        {
+            if strict {
+                panic!("invalid prebuilt sandbox runtime layout: {err}");
+            }
+            println!("cargo:warning=invalid prebuilt sandbox runtime layout: {err}");
+        }
+
+        for (relative, absolute, mode_bits) in entries {
+            body.push_str(&format!(
+                "    ({:?}, include_bytes!(r#\"{}\"#), 0o{:o}),\n",
+                relative,
+                absolute.display(),
+                mode_bits
+            ));
+        }
+    } else if let Some(dir) = runtime_lib_dir.as_deref()
         && let Ok(entries) = collect_runtime_files(dir)
     {
         for path in entries {
@@ -277,6 +315,24 @@ fn prepare_prebuilt_runtime_libs(out_dir: &Path) -> Option<PathBuf> {
         .join("lib")
         .is_dir()
         .then_some(runtime_root.join("lib"))
+}
+
+fn prepare_prebuilt_runtime_root(out_dir: &Path) -> Option<PathBuf> {
+    if let Some(root) = discover_runtime_root() {
+        return Some(root);
+    }
+
+    let tarball = discover_runtime_tarball()?;
+    let extract_root = out_dir.join("sandbox-runtime-prebuilt");
+    let runtime_root = extract_root.join("runtime");
+    if !runtime_root.join("lib").is_dir() {
+        if extract_root.exists() {
+            fs::remove_dir_all(&extract_root).ok()?;
+        }
+        fs::create_dir_all(&extract_root).ok()?;
+        extract_tarball(&tarball, &extract_root).ok()?;
+    }
+    runtime_root.join("lib").is_dir().then_some(runtime_root)
 }
 
 fn discover_runtime_source_dirs() -> Option<(PathBuf, PathBuf)> {
@@ -384,6 +440,57 @@ fn collect_runtime_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     }
     files.sort();
     Ok(files)
+}
+
+fn collect_runtime_bundle_files(root: &Path) -> std::io::Result<Vec<(String, PathBuf, u32)>> {
+    let mut files = Vec::new();
+    for subdir in ["bin", "lib"] {
+        let dir = root.join(subdir);
+        if !dir.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() || fs::symlink_metadata(&path)?.file_type().is_symlink() {
+                files.push((
+                    format!("{subdir}/{}", entry.file_name().to_string_lossy()),
+                    path,
+                    if subdir == "bin" { 0o755 } else { 0o644 },
+                ));
+            }
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(files)
+}
+
+fn validate_prebuilt_runtime_root(root: &Path) -> std::io::Result<()> {
+    for helper in [
+        "rkforge",
+        "rkforge-sandbox-shim",
+        "rkforge-sandbox-agent",
+        "rkforge-sandbox-guest-init",
+    ] {
+        let path = root.join("bin").join(helper);
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(std::io::Error::other(format!(
+                "expected regular helper binary at {}",
+                path.display()
+            )));
+        }
+    }
+    for lib in ["libkrun.so", "libkrunfw.so"] {
+        let path = root.join("lib").join(lib);
+        if !path.is_file() {
+            return Err(std::io::Error::other(format!(
+                "missing required runtime library {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn discover_runtime_tarball() -> Option<PathBuf> {

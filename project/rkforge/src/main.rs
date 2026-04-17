@@ -30,6 +30,8 @@ use crate::args::{Cli, Commands};
 use crate::commands::{compose, config_cli, container, pod, volume};
 use anyhow::Result;
 use clap::Parser;
+#[cfg(feature = "sandbox")]
+use std::path::Path;
 use tracing_subscriber::prelude::*;
 
 fn main() -> Result<()> {
@@ -39,8 +41,24 @@ fn main() -> Result<()> {
         .init();
 
     #[cfg(feature = "sandbox")]
-    if sandbox::guest::should_run_as_init() {
-        return sandbox::guest::run_as_init();
+    {
+        if let Some(helper_name) = std::env::args_os().next().and_then(|arg0| {
+            Path::new(&arg0)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        }) {
+            match helper_name.as_str() {
+                "rkforge-sandbox-shim" => return sandbox::vm::run_shim_binary(),
+                "rkforge-sandbox-agent" => return sandbox::agent::run_binary(),
+                "rkforge-sandbox-guest-init" => return sandbox::guest::run_binary(),
+                _ => {}
+            }
+        }
+
+        if sandbox::guest::should_run_as_init() {
+            return sandbox::guest::run_as_init();
+        }
     }
 
     let cli = Cli::parse();

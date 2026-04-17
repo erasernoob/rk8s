@@ -1,5 +1,6 @@
 use crate::sandbox::types::{
-    SandboxCreateOptions, SandboxExecOptions, SandboxExecResult, SandboxMetadata,
+    SandboxCreateOptions, SandboxExecOptions, SandboxExecResult, SandboxExecSpec,
+    SandboxExecTarget, SandboxMetadata,
 };
 use crate::sandbox::{ExecRequest, SandboxBox, SandboxRuntime, SandboxRuntimeBuilder};
 use anyhow::{Result, anyhow};
@@ -101,10 +102,9 @@ impl SandboxHandle {
         args: Vec<String>,
         options: SandboxExecOptions,
     ) -> Result<SandboxExecResult> {
-        let mut request = ExecRequest::new(self.inner.id.clone(), command.into());
-        request.args = args;
-        request.timeout_secs = options.timeout_secs;
-        Ok(self.inner.exec_request(request).await?.into())
+        let mut spec = SandboxExecSpec::command(command, args);
+        spec.timeout_secs = options.timeout_secs;
+        self.execute(spec).await
     }
 
     pub async fn exec_python(
@@ -112,10 +112,26 @@ impl SandboxHandle {
         code: impl Into<String>,
         options: SandboxExecOptions,
     ) -> Result<SandboxExecResult> {
-        let mut request = ExecRequest::new(self.inner.id.clone(), "python3");
-        request.inline_code = Some(code.into());
-        request.language = Some("python".to_string());
-        request.timeout_secs = options.timeout_secs;
+        let mut spec = SandboxExecSpec::python(code);
+        spec.timeout_secs = options.timeout_secs;
+        self.execute(spec).await
+    }
+
+    pub async fn execute(&self, spec: SandboxExecSpec) -> Result<SandboxExecResult> {
+        let mut request = match spec.target {
+            SandboxExecTarget::Command { command, args } => {
+                let mut request = ExecRequest::new(self.inner.id.clone(), command);
+                request.args = args;
+                request
+            }
+            SandboxExecTarget::Python { code } => {
+                let mut request = ExecRequest::new(self.inner.id.clone(), "python3");
+                request.inline_code = Some(code);
+                request.language = Some("python".to_string());
+                request
+            }
+        };
+        request.timeout_secs = spec.timeout_secs;
         Ok(self.inner.exec_request(request).await?.into())
     }
 

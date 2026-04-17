@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use clap::Args;
+use clap::{Args, Parser};
 use nix::mount::{MsFlags, mount};
 use nix::unistd::execv;
 use std::ffi::CString;
@@ -8,6 +8,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use tracing::debug;
 
+const GUEST_AGENT_BINARY_PATH: &str = "/usr/local/bin/rkforge-sandbox-agent";
 const DEFAULT_AGENT_VSOCK_PORT: u32 = 26_950;
 const DEFAULT_READY_VSOCK_PORT: u32 = 26_951;
 
@@ -44,6 +45,16 @@ pub fn run_as_init() -> Result<()> {
 
 pub fn run_command(args: SandboxGuestInitArgs) -> Result<()> {
     run_guest_init(args)
+}
+
+#[derive(Parser)]
+struct SandboxGuestInitBinaryCli {
+    #[command(flatten)]
+    args: SandboxGuestInitArgs,
+}
+
+pub fn run_binary() -> Result<()> {
+    run_command(SandboxGuestInitBinaryCli::parse().args)
 }
 
 fn run_guest_init(args: SandboxGuestInitArgs) -> Result<()> {
@@ -113,18 +124,17 @@ fn exec_agent(vsock_port: u32) -> Result<()> {
         read_kernel_cmdline_value("rkforge.sandbox_id").unwrap_or_else(|| "unknown".to_string());
     let current_exe =
         std::env::current_exe().context("failed to resolve current executable inside guest")?;
-    let current_exe = canonical_binary_path(current_exe);
+    let current_exe = canonical_agent_binary_path(current_exe);
     debug!(
         sandbox_id=%sandbox_id,
         vsock_port,
         ready_vsock_port,
         current_exe=%current_exe.display(),
-        "execing sandbox-agent from guest init"
+        "execing sandbox agent helper from guest init"
     );
     let current_exe = CString::new(current_exe.as_os_str().as_bytes())
         .context("guest init path contains interior NUL")?;
-    let arg0 = CString::new("rkforge").unwrap();
-    let subcommand = CString::new("sandbox-agent").unwrap();
+    let arg0 = CString::new("rkforge-sandbox-agent").unwrap();
     let vsock_port_flag = CString::new("--vsock-port").unwrap();
     let vsock_port = CString::new(vsock_port.to_string()).unwrap();
     let ready_port_flag = CString::new("--ready-vsock-port").unwrap();
@@ -133,7 +143,6 @@ fn exec_agent(vsock_port: u32) -> Result<()> {
     let sandbox_id = CString::new(sandbox_id).context("sandbox id contains interior NUL")?;
     let argv = [
         &arg0,
-        &subcommand,
         &vsock_port_flag,
         &vsock_port,
         &ready_port_flag,
@@ -141,12 +150,12 @@ fn exec_agent(vsock_port: u32) -> Result<()> {
         &sandbox_id_flag,
         &sandbox_id,
     ];
-    execv(&current_exe, &argv).context("failed to exec sandbox-agent from guest init")?;
+    execv(&current_exe, &argv).context("failed to exec sandbox agent helper from guest init")?;
     bail!("execv returned unexpectedly")
 }
 
-fn canonical_binary_path(current_exe: PathBuf) -> PathBuf {
-    let preferred = PathBuf::from("/usr/local/bin/rkforge");
+fn canonical_agent_binary_path(current_exe: PathBuf) -> PathBuf {
+    let preferred = PathBuf::from(GUEST_AGENT_BINARY_PATH);
     if preferred.is_file() {
         preferred
     } else {

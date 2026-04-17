@@ -82,6 +82,42 @@ impl SandboxExecOptions {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SandboxExecTarget {
+    Command { command: String, args: Vec<String> },
+    Python { code: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxExecSpec {
+    pub target: SandboxExecTarget,
+    pub timeout_secs: Option<u64>,
+}
+
+impl SandboxExecSpec {
+    pub fn command(command: impl Into<String>, args: Vec<String>) -> Self {
+        Self {
+            target: SandboxExecTarget::Command {
+                command: command.into(),
+                args,
+            },
+            timeout_secs: None,
+        }
+    }
+
+    pub fn python(code: impl Into<String>) -> Self {
+        Self {
+            target: SandboxExecTarget::Python { code: code.into() },
+            timeout_secs: None,
+        }
+    }
+
+    pub fn timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.timeout_secs = Some(timeout_secs);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxExecResult {
     pub request_id: String,
     pub stdout: String,

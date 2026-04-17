@@ -34,7 +34,7 @@ pub struct FirecrackerVmBackend {
 impl FirecrackerVmBackend {
     pub fn new(root: PathBuf) -> Result<Self> {
         let assets = RuntimeAssetBundle::prepare(&root)?;
-        let shim_binary = assets.rkforge_binary().to_path_buf();
+        let shim_binary = assets.shim_binary().to_path_buf();
         let firecracker_binary = find_firecracker_binary().ok_or_else(|| {
             anyhow!("failed to locate firecracker binary; set RKFORGE_FIRECRACKER_BIN")
         })?;
