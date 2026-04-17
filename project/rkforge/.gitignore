@@ -8,3 +8,5 @@ src/bin
 *.log
 *.txt
 filter_log.py
+.target-codex/
+runtime/current/
